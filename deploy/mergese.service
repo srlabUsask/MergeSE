@@ -1,0 +1,44 @@
+# /etc/systemd/system/mergese.service
+#
+# Bare-metal alternative to docker-compose. Drop this file in place, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mergese
+#
+# Adjust User=, Group=, the install path, and MERGESE_CHECKPOINTS to match the host.
+# This template assumes MergeSE is installed under /opt/mergese.
+
+[Unit]
+Description=MergeSE web service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mergese
+Group=mergese
+WorkingDirectory=/opt/mergese
+
+Environment="PYTHONUNBUFFERED=1"
+Environment="MERGESE_HOST=127.0.0.1"
+Environment="MERGESE_PORT=8765"
+Environment="MERGESE_MAX_CONCURRENT=2"
+Environment="MERGESE_CHECKPOINTS=/opt/mergese/checkpoints"
+Environment="HF_HOME=/opt/mergese/.cache/huggingface"
+
+# Use the local venv if present, otherwise system python
+ExecStart=/opt/mergese/.venv/bin/gunicorn \
+    -w 2 -k gthread --threads 8 -t 0 \
+    -b 127.0.0.1:8765 server.app:app
+
+Restart=on-failure
+RestartSec=4
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/mergese/artifacts /opt/mergese/uploads
+
+[Install]
+WantedBy=multi-user.target

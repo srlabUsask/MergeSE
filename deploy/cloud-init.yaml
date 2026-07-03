@@ -1,0 +1,21 @@
+#cloud-config
+# MergeSE first-boot provisioning for an Ubuntu VM.
+#
+# Paste this as the instance "user data" (Configuration -> User Data in
+# Horizon, or `openstack server create --user-data cloud-init.yaml ...`) when
+# launching the VM. On first boot it installs Docker and brings the web tool up
+# behind nginx on port 80.
+#
+# For HTTPS: point your DNS record at the VM's floating IP, then SSH in and run
+#   sudo /opt/mergese/deploy/provision.sh --domain <fqdn> --email <addr>
+# See docs/DEPLOY.md for the full runbook.
+
+package_update: true
+
+packages:
+  - git
+  - curl
+
+runcmd:
+  - git clone https://github.com/srlabUsask/MergeSE.git /opt/mergese
+  - bash /opt/mergese/deploy/provision.sh --dir /opt/mergese

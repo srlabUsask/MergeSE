@@ -1,0 +1,38 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+
+# Artifacts produced by the server
+artifacts/
+uploads/
+checkpoints/
+test_sandbox/
+*.onnx
+*.pt
+*.safetensors
+*.bin
+
+# Site builds
+_site/
+dist/
+build/
+*.egg-info/
+
+# Editor / OS
+.idea/
+*.swp
+
+# VS Code: commit project-wide config, ignore personal settings
+.vscode/*
+!.vscode/tasks.json
+!.vscode/extensions.json
+!.vscode/launch.json
+
+# Local scratch
+scratch/
+

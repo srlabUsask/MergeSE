@@ -1,0 +1,13 @@
+click>=8.1
+torch>=2.0
+transformers>=4.40
+safetensors>=0.4
+rich>=13.0
+tqdm>=4.65
+numpy>=1.23
+# server only - safe to install everywhere
+flask>=3.0
+flask-cors>=4.0
+gunicorn>=21.2
+# HuggingFace Datasets (server picks them up if installed; pure-python fallback otherwise)
+datasets>=2.18

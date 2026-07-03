@@ -1,0 +1,56 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Docker: Build image",
+      "type": "shell",
+      "command": "docker build -t mergese:latest .",
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Build the MergeSE container image (mergese:latest)."
+    },
+    {
+      "label": "Docker Compose: Up",
+      "type": "shell",
+      "command": "docker compose up -d --build",
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Build (if needed) and start the MergeSE stack in the background on http://localhost:8765."
+    },
+    {
+      "label": "Docker Compose: Down",
+      "type": "shell",
+      "command": "docker compose down",
+      "problemMatcher": [],
+      "detail": "Stop and remove the MergeSE containers (volumes are kept)."
+    },
+    {
+      "label": "Docker Compose: Logs",
+      "type": "shell",
+      "command": "docker compose logs -f",
+      "problemMatcher": [],
+      "isBackground": true,
+      "detail": "Follow logs from the running MergeSE container."
+    },
+    {
+      "label": "Docker Compose: Restart",
+      "type": "shell",
+      "command": "docker compose restart",
+      "problemMatcher": [],
+      "detail": "Restart the MergeSE container without rebuilding the image."
+    },
+    {
+      "label": "MergeSE: Dev server (no Docker)",
+      "type": "shell",
+      "command": "python server/app.py",
+      "problemMatcher": [],
+      "options": {
+        "env": {
+          "MERGESE_PORT": "8765",
+          "MERGESE_HOST": "0.0.0.0"
+        }
+      },
+      "detail": "Run the Flask dev server directly (requires `pip install .[server]`). Useful when Docker isn't available."
+    }
+  ]
+}

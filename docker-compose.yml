@@ -1,0 +1,39 @@
+services:
+  mergese:
+    build: .
+    image: mergese:latest
+    container_name: mergese
+    restart: unless-stopped
+    # Resource caps so a single heavy or runaway job cannot exhaust the host.
+    # Tune to the VM; leave headroom for the OS and nginx.
+    mem_limit: 6g
+    cpus: 3.0
+    pids_limit: 512
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      MERGESE_HOST: "0.0.0.0"
+      MERGESE_PORT: "8765"
+      MERGESE_MAX_CONCURRENT: "2"
+      # Cap on queued + running jobs before new submissions get a 429.
+      MERGESE_MAX_QUEUE: "8"
+      # Hours before uploads and job artifacts are auto-removed to protect disk.
+      MERGESE_UPLOAD_TTL_HOURS: "48"
+      MERGESE_ARTIFACT_TTL_HOURS: "48"
+      # Server-mounted checkpoints are OFF by default: the tool is upload-driven,
+      # and public base models are offered as HuggingFace suggestions. An operator
+      # who wants to preload a curated set can uncomment MERGESE_CHECKPOINTS below
+      # and the matching read-only volume mount.
+      # MERGESE_CHECKPOINTS: "/data/checkpoints"
+    volumes:
+      - hf_cache:/data/hf
+      - artifacts:/app/artifacts
+      - uploads:/app/uploads
+      # Optional: mount a curated checkpoint directory read-only (pairs with the
+      # MERGESE_CHECKPOINTS line above).
+      # - ${MERGESE_CKPT_HOST:-./checkpoints}:/data/checkpoints:ro
+
+volumes:
+  hf_cache:
+  artifacts:
+  uploads:

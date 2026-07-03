@@ -1,0 +1,50 @@
+# Keep the build context small. Anything not needed at runtime stays out of the
+# image; the artifacts/ and uploads/ trees are runtime data, not source code.
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Build outputs
+dist/
+build/
+_site/
+
+# Runtime data - mounted as volumes, never baked in
+artifacts/
+uploads/
+checkpoints/
+
+# Local scratch
+scratch/
+
+# CI / docs / host-side deploy configs that don't need to be in the image
+.github/
+docs/
+deploy/
+README.md
+LICENSE
+
+# Tests aren't run inside the image
+tests/
+
+# Frontend node-modules (none today, but future-proof)
+frontend/node_modules/

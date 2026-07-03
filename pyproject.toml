@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mergese"
+version = "0.2.0"
+description = "Post-hoc model merging for software engineering - CLI + web tool."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Palash R. Roy" },
+    { name = "Banani Roy" },
+    { name = "Chanchal K. Roy" },
+    { name = "Kevin A. Schneider" },
+]
+keywords = [
+    "model-merging", "software-engineering", "code-models",
+    "ties", "dare", "huggingface", "transformers", "task-vectors",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "click>=8.1",
+    "torch>=2.0",
+    "transformers>=4.40",
+    "safetensors>=0.4",
+    "rich>=13.0",
+    "tqdm>=4.65",
+    "numpy>=1.23",
+]
+
+[project.optional-dependencies]
+server = [
+    "flask>=3.0",
+    "flask-cors>=4.0",
+    "gunicorn>=21.2",
+]
+datasets = [
+    "datasets>=2.18",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+mergese = "mergese:main"
+
+[project.urls]
+Homepage = "https://github.com/srlabUsask/MergeSE"
+Repository = "https://github.com/srlabUsask/MergeSE"
+Issues = "https://github.com/srlabUsask/MergeSE/issues"
+
+[tool.setuptools]
+py-modules = ["mergese", "mergese_tasks"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["server*"]
+exclude = ["artifacts*", "uploads*", "tests*", "deploy*", "frontend*", "data*"]

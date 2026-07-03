@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MergeSE - Model Merging for Software Engineering</title>
+<meta name="description" content="Post-hoc model merging for software-engineering models. TIES, DARE-TIES, and task-vector averaging on fine-tuned HuggingFace checkpoints." />
+<link rel="icon" href="favicon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+      <defs>
+        <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#7c5cff"/>
+          <stop offset="100%" stop-color="#22d3ee"/>
+        </linearGradient>
+      </defs>
+      <circle cx="20" cy="32" r="12" fill="none" stroke="url(#lg)" stroke-width="3"/>
+      <circle cx="44" cy="32" r="12" fill="none" stroke="url(#lg)" stroke-width="3"/>
+      <path d="M20 32 L44 32" stroke="url(#lg)" stroke-width="3" stroke-linecap="round"/>
+      <circle cx="32" cy="32" r="3" fill="#22d3ee"/>
+    </svg>
+    <div>
+      <div class="title">MergeSE</div>
+      <div class="subtitle">Post-hoc model merging for software engineering</div>
+    </div>
+  </div>
+  <nav>
+    <a href="#library">Library</a>
+    <a href="#inspect">Inspect</a>
+    <a href="#merge">Merge</a>
+    <a href="#evaluate">Evaluate</a>
+    <a href="#export">Export</a>
+    <a href="#jobs">Jobs</a>
+    <a href="#docs">Docs</a>
+    <a href="#jobs" id="runningPill" class="running-pill" hidden>
+      <span class="spin"></span>
+      <span id="runningPillText">0 running</span>
+    </a>
+    <a href="https://github.com/" id="ghLink" class="gh-link" target="_blank" rel="noopener">GitHub</a>
+  </nav>
+</header>
+
+<main>
+
+  <section class="hero">
+    <div class="hero-text">
+      <h1>Merge fine-tuned SE models <span class="grad">without retraining</span>.</h1>
+      <p class="lead">
+        TIES / DARE-TIES / averaging on any HuggingFace encoder - for
+        <strong>clone detection</strong>, <strong>vulnerability detection</strong>,
+        <strong>defect prediction</strong>, <strong>code-smell</strong>,
+        <strong>commit classification</strong> and more. One CLI, one web tool;
+        no retraining, no labels. Built alongside our ASE submission.
+      </p>
+      <div class="hero-cta">
+        <a class="btn btn-primary" href="#merge">Try a merge</a>
+        <a class="btn btn-ghost" href="#docs">Read the docs</a>
+      </div>
+      <div class="status-line" id="healthLine">
+        <span class="dot pulse"></span>
+        <span id="healthText">connecting to backend...</span>
+      </div>
+    </div>
+    <div class="hero-card">
+      <div class="codecard">
+        <div class="codecard-head"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="cc-title">terminal</span></div>
+<pre><code><span class="prompt">$</span> mergese inspect <span class="arg">microsoft/codebert-base</span> \
+                  <span class="arg">microsoft/graphcodebert-base</span> \
+                  --base <span class="arg">microsoft/codebert-base</span>
+<span class="ok">✓</span> verdict: <span class="ok">COMPATIBLE</span>
+  cosine similarity:   <span class="num">+0.7421</span>
+  sign agreement:      <span class="num">73.4%</span>
+
+<span class="prompt">$</span> mergese merge <span class="arg">m1 m2 m3</span> --base <span class="arg">base</span> \
+                --method <span class="arg">dare-ties</span> --drop-rate <span class="num">0.3</span> \
+                --output <span class="arg">./merged</span>
+<span class="ok">✓</span> merged in <span class="num">11.3s</span>  <span class="muted">(20% trimmed, 12.4% sign conflicts resolved)</span></code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────────────────────────────── Checkpoint library ─────────────────────────────────────── -->
+  <section id="library" class="card">
+    <header class="card-head">
+      <div>
+        <h2>Checkpoint library</h2>
+        <p>Upload your model <strong>once here</strong>; every form below picks from this list. Public HuggingFace IDs (like <code>microsoft/codebert-base</code>) don't need uploading - just type them when needed.</p>
+      </div>
+      <span class="step-badge">library</span>
+    </header>
+
+    <div id="libUpload" class="upload-card">
+      <label class="dropzone" id="libDropzone">
+        <input type="file" id="libFile" accept=".zip" hidden />
+        <div class="dz-inner">
+          <div class="dz-title">Drop a .zip checkpoint here</div>
+          <div class="dz-sub">or click to browse · must contain <code>config.json</code> + <code>model.safetensors</code> or <code>pytorch_model.bin</code></div>
+        </div>
+      </label>
+      <div id="libProgress" class="lib-progress" hidden>
+        <div class="bar"><div id="libBar"></div></div>
+        <div id="libProgressText" class="muted-tiny"></div>
+      </div>
+    </div>
+
+    <div class="lib-search">
+      <svg class="lib-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.5" y2="16.5"></line></svg>
+      <input type="text" id="libSearch" placeholder="Search checkpoints by name or reference..." autocomplete="off" aria-label="Search checkpoints" />
+    </div>
+
+    <div id="libGroups" class="lib-groups">
+      <div class="lib-group" data-group="uploads">
+        <div class="lib-group-head">Your uploads <span class="dim" id="libUploadsCount">(0)</span></div>
+        <div class="lib-items" id="libUploadsItems"></div>
+      </div>
+      <div class="lib-group" data-group="server" hidden>
+        <div class="lib-group-head">Server-mounted <span class="dim" id="libServerCount">(0)</span></div>
+        <div class="lib-items" id="libServerItems"></div>
+      </div>
+      <div class="lib-group" data-group="jobs">
+        <div class="lib-group-head">From finished jobs <span class="dim" id="libJobsCount">(0)</span></div>
+        <div class="lib-items" id="libJobsItems"></div>
+      </div>
+    </div>
+
+    <div class="lib-divider">
+      <span>Datasets for evaluation</span>
+      <label class="file-btn small">
+        <input type="file" id="libDatasetFile" accept=".csv,.zip" hidden />
+        + Upload .csv
+      </label>
+    </div>
+
+    <div class="lib-search">
+      <svg class="lib-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.5" y2="16.5"></line></svg>
+      <input type="text" id="libDsSearch" placeholder="Search datasets by name or reference..." autocomplete="off" aria-label="Search datasets" />
+    </div>
+
+    <div id="libDatasetGroups" class="lib-groups">
+      <div class="lib-group" data-group="ds-bundled">
+        <div class="lib-group-head">Bundled benchmarks <span class="dim" id="libDsBundledCount">(0)</span></div>
+        <div class="lib-items" id="libDsBundledItems"></div>
+      </div>
+      <div class="lib-group" data-group="ds-uploads">
+        <div class="lib-group-head">Your dataset uploads <span class="dim" id="libDsUploadsCount">(0)</span></div>
+        <div class="lib-items" id="libDsUploadsItems"></div>
+      </div>
+      <div class="lib-group" data-group="ds-server" hidden>
+        <div class="lib-group-head">Server-mounted CSVs <span class="dim" id="libDsServerCount">(0)</span></div>
+        <div class="lib-items" id="libDsServerItems"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────────────────────────────── Inspect ─────────────────────────────────────── -->
+  <section id="inspect" class="card">
+    <header class="card-head">
+      <div>
+        <h2>1. Inspect compatibility</h2>
+        <p>Verify two or more checkpoints share a tokenizer, architecture, and base. Compute pairwise task-vector cosine similarity and sign agreement.</p>
+      </div>
+      <span class="step-badge">inspect</span>
+    </header>
+
+    <form id="inspectForm" class="grid">
+      <div class="full">
+        <div class="field-label">Models to compare</div>
+        <div id="iModelsList" class="model-list" data-min="2"></div>
+        <button type="button" class="btn btn-ghost btn-sm" data-add-model="iModelsList">+ Add model</button>
+      </div>
+      <div class="full">
+        <div class="field-label">Base checkpoint <span class="dim">(optional, enables task-vector metrics)</span></div>
+        <div id="iBaseList" class="model-list" data-min="0" data-max="1"></div>
+        <button type="button" class="btn btn-ghost btn-sm" data-add-model="iBaseList">+ Set base</button>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" type="submit">Inspect</button>
+        <button class="btn btn-ghost" data-preset="inspect" type="button">Load preset</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ─────────────────────────────────────── Merge ─────────────────────────────────────── -->
+  <section id="merge" class="card">
+    <header class="card-head">
+      <div>
+        <h2>2. Merge checkpoints</h2>
+        <p>TIES / DARE-TIES / averaging on task vectors <code>Δ<sub>k</sub> = θ<sub>k</sub> - θ<sub>base</sub></code>. Final model is written in HuggingFace format.</p>
+      </div>
+      <span class="step-badge">merge</span>
+    </header>
+
+    <form id="mergeForm" class="grid">
+      <div class="full">
+        <div class="field-label">Fine-tuned models</div>
+        <div id="mModelsList" class="model-list" data-min="2"></div>
+        <button type="button" class="btn btn-ghost btn-sm" data-add-model="mModelsList">+ Add model</button>
+      </div>
+      <div class="full">
+        <div class="field-label">Base checkpoint</div>
+        <div id="mBaseList" class="model-list" data-min="1" data-max="1"></div>
+      </div>
+      <label>
+        <span>Method</span>
+        <select id="mMethod">
+          <option value="ties" selected>TIES</option>
+          <option value="dare-ties">DARE-TIES</option>
+          <option value="wudi">WUDI</option>
+          <option value="average">Average</option>
+        </select>
+      </label>
+      <label>
+        <span>Trim percentile</span>
+        <input id="mTrim" type="number" min="0" max="99" step="1" value="20" />
+        <small id="mTrimHint" class="hint-inline"></small>
+      </label>
+      <label>
+        <span>DARE drop rate</span>
+        <input id="mDrop" type="number" min="0" max="0.95" step="0.05" value="0.3" />
+        <small id="mDropHint" class="hint-inline"></small>
+      </label>
+      <label>
+        <span>WUDI steps</span>
+        <input id="mWudiSteps" type="number" min="1" max="5000" step="1" value="300" />
+        <small id="mWudiStepsHint" class="hint-inline"></small>
+      </label>
+      <label>
+        <span>WUDI learning rate</span>
+        <input id="mWudiLr" type="number" min="0" max="1" step="0.00001" value="0.00001" />
+        <small id="mWudiLrHint" class="hint-inline"></small>
+      </label>
+      <label>
+        <span>Weights (comma-separated, optional)</span>
+        <input id="mWeights" type="text" placeholder="1,1,0.5" />
+        <small id="mWeightsHint" class="hint-inline">defaults to equal weights</small>
+      </label>
+      <label>
+        <span>Seed</span>
+        <input id="mSeed" type="number" value="42" />
+        <small id="mSeedHint" class="hint-inline">RNG for DARE; deterministic per-seed</small>
+      </label>
+      <label>
+        <span>Task (optional hint)</span>
+        <select id="mTask"><option value="">- none -</option></select>
+      </label>
+      <label>
+        <span>Heads policy</span>
+        <select id="mHeads">
+          <option value="auto" selected>Auto - skip if shapes differ</option>
+          <option value="encoder_only">Encoder only (skip all heads)</option>
+          <option value="include">Include heads (force-merge)</option>
+        </select>
+      </label>
+      <div class="actions full">
+        <button class="btn btn-primary" type="submit">Run merge</button>
+        <button class="btn btn-ghost" data-preset="merge" type="button">Load preset</button>
+        <span class="hint">Merging across different tasks? Use <strong>Encoder only</strong>.</span>
+      </div>
+    </form>
+  </section>
+
+  <!-- ─────────────────────────────────────── Evaluate ─────────────────────────────────────── -->
+  <section id="evaluate" class="card">
+    <header class="card-head">
+      <div>
+        <h2>3. Evaluate</h2>
+        <p>Run the merged model on a CSV benchmark and report accuracy / precision / recall / F1.</p>
+      </div>
+      <span class="step-badge">evaluate</span>
+    </header>
+
+    <form id="evalForm" class="grid">
+      <div class="full">
+        <div class="field-label">Model to evaluate</div>
+        <div id="eModelList" class="model-list" data-min="1" data-max="1"></div>
+      </div>
+      <label>
+        <span>Task</span>
+        <select id="eTask"></select>
+      </label>
+      <label>
+        <span>Metric</span>
+        <select id="eMetric">
+          <option value="auto" selected>Auto (from task / labels)</option>
+          <option value="binary">Binary F1</option>
+          <option value="macro">Macro F1</option>
+        </select>
+      </label>
+      <div class="full">
+        <div class="field-label">Dataset
+          <span class="dim">- pick a bundled benchmark, your upload, an HF dataset, or any CSV with <code>code,label</code> or <code>code1,code2,label</code></span>
+        </div>
+        <div id="eDatasetList" class="model-list" data-min="1" data-max="1" data-kind="dataset"></div>
+        <small id="eDatasetHint" class="hint-inline"></small>
+      </div>
+      <label>
+        <span>Batch size</span>
+        <input id="eBatch" type="number" value="32" />
+      </label>
+      <label>
+        <span>Max length</span>
+        <input id="eMaxLen" type="number" value="512" />
+      </label>
+      <label>
+        <span>Limit (0 = full)</span>
+        <input id="eLimit" type="number" value="0" />
+      </label>
+      <div class="actions full">
+        <button class="btn btn-primary" type="submit">Run evaluation</button>
+        <button class="btn btn-ghost" data-preset="evaluate" type="button">Load preset</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ─────────────────────────────────────── Export ─────────────────────────────────────── -->
+  <section id="export" class="card">
+    <header class="card-head">
+      <div>
+        <h2>4. Export</h2>
+        <p>Repackage the merged model as HuggingFace, ONNX, or TorchScript for downstream deployment.</p>
+      </div>
+      <span class="step-badge">export</span>
+    </header>
+
+    <form id="exportForm" class="grid">
+      <div class="full">
+        <div class="field-label">Model to export</div>
+        <div id="xModelList" class="model-list" data-min="1" data-max="1"></div>
+      </div>
+      <label>
+        <span>Format</span>
+        <select id="xFormat">
+          <option value="huggingface" selected>HuggingFace</option>
+          <option value="onnx">ONNX</option>
+          <option value="torchscript">TorchScript</option>
+        </select>
+      </label>
+      <label>
+        <span>Max length (tracing)</span>
+        <input id="xMaxLen" type="number" value="512" />
+      </label>
+      <div class="actions full">
+        <button class="btn btn-primary" type="submit">Export</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ─────────────────────────────────────── Jobs panel ─────────────────────────────────────── -->
+  <section id="jobs" class="card">
+    <header class="card-head">
+      <div>
+        <h2>Jobs</h2>
+        <p>Live logs and final reports for every run on this server.</p>
+      </div>
+      <div class="actions inline">
+        <button class="btn btn-ghost" id="refreshJobs" type="button">Refresh</button>
+      </div>
+    </header>
+
+    <div class="jobs-layout">
+      <ul id="jobList" class="job-list"></ul>
+      <div id="jobDetail" class="job-detail">
+        <div class="empty">Select a job to view its log.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────────────────────────────── Docs ─────────────────────────────────────── -->
+  <section id="docs" class="card">
+    <header class="card-head">
+      <div>
+        <h2>How it works</h2>
+        <p>MergeSE turns post-hoc model merging - the technique behind our ASE 2026 submission - into a one-command CLI and a web UI.</p>
+      </div>
+    </header>
+
+    <div class="docs-grid">
+      <div>
+        <h3>SE tasks covered</h3>
+        <p>Clone detection, vulnerability detection, defect / bug prediction, code-smell detection, commit classification, code-review acceptability, comment-code consistency, exception-type prediction, type inference, plus any custom binary or multi-class CSV.</p>
+      </div>
+      <div>
+        <h3>Task vectors</h3>
+        <p>For each fine-tuned model <code>θ<sub>k</sub></code> and a shared base <code>θ<sub>base</sub></code>, we compute <code>Δ<sub>k</sub> = θ<sub>k</sub> - θ<sub>base</sub></code>. These deltas isolate what fine-tuning learned and are the unit of merging.</p>
+      </div>
+      <div>
+        <h3>TIES</h3>
+        <p>Trim small |Δ| values (by percentile), elect a per-parameter majority sign, then keep only the sign-agreeing entries when averaging. Reduces destructive interference between tasks.</p>
+      </div>
+      <div>
+        <h3>DARE-TIES</h3>
+        <p>Randomly drop a fraction <code>p</code> of Δ entries and rescale by <code>1/(1-p)</code>, then apply TIES. Adds a sparsity prior, often improving merges of 3+ models.</p>
+      </div>
+      <div>
+        <h3>Cross-task merging</h3>
+        <p>Merging a clone detector with a vulnerability detector? Their classifier heads differ in shape. MergeSE auto-detects this and merges the <em>encoder</em> only - keeping the base's head - so you can re-attach a fresh head for the downstream task.</p>
+      </div>
+      <div>
+        <h3>Pipeline</h3>
+        <p>
+          <code>tasks</code> &rarr; discover &rarr;
+          <code>inspect</code> &rarr; verify &rarr;
+          <code>merge</code> &rarr; HF checkpoint &rarr;
+          <code>evaluate</code> &rarr; F1 / macro-F1 &rarr;
+          <code>export</code> &rarr; HF / ONNX / TorchScript.
+        </p>
+      </div>
+    </div>
+
+    <pre class="snippet"><code># Install
+pip install -r requirements.txt
+
+# CLI
+python mergese.py inspect microsoft/codebert-base microsoft/graphcodebert-base --base microsoft/codebert-base
+python mergese.py merge   m1 m2 --base base --method dare-ties --output ./merged
+python mergese.py evaluate ./merged --task clone_detection --test-file bcb_test.csv
+python mergese.py export  ./merged --format onnx --output ./merged.onnx
+
+# Web (this UI)
+python server/app.py    # then open http://localhost:8765
+</code></pre>
+  </section>
+
+  <footer>
+    <div>MergeSE &middot; ASE 2026 Tool Track: "MergeSE: Post-hoc Model Merging for Software Engineering Tasks Without Retraining"</div>
+    <div>Built on the methodology of our research-track submission "A Unified Model for Cross-Domain Clone Detection via Model Merging"</div>
+    <div>Palash R. Roy &middot; Banani Roy &middot; Chanchal K. Roy &middot; Kevin A. Schneider &middot; University of Saskatchewan</div>
+  </footer>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

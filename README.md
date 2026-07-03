@@ -1,0 +1,241 @@
+# MergeSE - Post-hoc Model Merging for Software Engineering
+
+[![CI](https://github.com/srlabUsask/MergeSE/actions/workflows/ci.yml/badge.svg)](https://github.com/srlabUsask/MergeSE/actions/workflows/ci.yml)
+
+> Tool artifact for the ASE 2026 Tool-Track submission
+> **"MergeSE: Post-hoc Model Merging for Software Engineering Tasks Without Retraining"**
+>
+> The underlying model-merging approach comes from our research-track
+> submission (under review):
+> **"A Unified Model for Cross-Domain Clone Detection via Model Merging"**
+
+MergeSE merges fine-tuned HuggingFace encoder checkpoints (CodeBERT,
+GraphCodeBERT, UniXcoder, CodeT5-encoder, ...) into a single model **without
+any training data**, and evaluates the result on standard software-engineering
+benchmarks. It ships as a single-file **CLI** and a **web tool** that share
+the same engine.
+
+It implements:
+
+- **TIES-Merging** (Yadav et al., NeurIPS 2023)
+- **DARE-TIES** (Yu et al., 2024)
+- **WUDI-Merging** (Cheng et al., ICML 2025)
+- **Task-vector averaging** (Ilharco et al., 2022)
+
+Plus end-to-end evaluation across the full range of SE classification tasks
+(clone detection, vulnerability detection, defect prediction, code-smell
+detection, commit classification, code-review acceptability, comment-code
+consistency, exception-type prediction, type inference, and any custom CSV)
+and one-command export to HuggingFace / ONNX / TorchScript.
+
+---
+
+## Three ways to use MergeSE
+
+Pick whichever fits your environment - all three sit on top of the same
+merging engine, so results are identical.
+
+| #  | Path                          | Best for                                                       |
+|----|-------------------------------|----------------------------------------------------------------|
+| 1  | **Web tool via Docker**       | Easiest setup. One command brings up the UI and REST API.      |
+| 2  | **Web tool without Docker**   | Same UI, but you'd rather run Flask directly in a venv.        |
+| 3  | **CLI tool**                  | Scripting, headless servers, reproducible runs, paper-grade evaluation. |
+
+Full references: [docs/WEB.md](docs/WEB.md) and [docs/CLI.md](docs/CLI.md).
+Deploying to a dedicated VM: [docs/DEPLOY.md](docs/DEPLOY.md).
+
+---
+
+## Quickstart
+
+```bash
+git clone https://github.com/srlabUsask/MergeSE.git
+cd MergeSE
+```
+
+### 1. Web tool with Docker
+
+```bash
+docker compose up -d --build      # -> http://localhost:8765
+```
+
+Open <http://localhost:8765> in your browser. Stop with `docker compose down`.
+
+**Common first-run issues:**
+
+- **`permission denied ... /var/run/docker.sock`** - your user isn't in the
+  `docker` group. One-time fix: `sudo usermod -aG docker $USER`, then open a
+  fresh shell. Or prefix the one-off command with `sudo`.
+- **`address already in use ... 8765`** - something else is bound to port 8765.
+  Either stop it (`sudo ss -ltnp | grep :8765` to find the PID), or remap the
+  host port in `docker-compose.yml` (e.g. `"127.0.0.1:8766:8765"`) and use
+  <http://localhost:8766> instead.
+
+### 2. Web tool without Docker (Flask in a venv)
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install --index-url https://download.pytorch.org/whl/cpu torch
+pip install ".[server,datasets]"
+
+python server/app.py               # -> http://localhost:8765
+```
+
+For production, swap `python server/app.py` for
+`gunicorn -c deploy/gunicorn.conf.py server.app:app`.
+
+### 3. CLI tool
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install --index-url https://download.pytorch.org/whl/cpu torch
+pip install .
+
+mergese inspect ./model_a ./model_b --base microsoft/codebert-base
+mergese merge   ./model_a ./model_b --base microsoft/codebert-base \
+                --method ties --output ./merged
+mergese evaluate ./merged --task clone_detection --test-file ./test.csv
+mergese export   ./merged --format onnx --output ./merged.onnx
+```
+
+This installs a `mergese` console script on your `$PATH`. To run without
+installing, use `python mergese.py ...` after `pip install -r requirements.txt`.
+
+---
+
+## Supported SE tasks
+
+| Task                        | Input  | Metric    | Known benchmarks                              |
+|-----------------------------|--------|-----------|-----------------------------------------------|
+| Clone detection             | pair   | binary F1 | BigCloneBench, CLCDSA, GPTCloneBench, POJ-104 |
+| Vulnerability detection     | single | binary F1 | Devign, ReVeal, Big-Vul, D2A, Draper          |
+| Defect / bug prediction     | single | binary F1 | Defects4J, PROMISE, CodeXGLUE-Defect          |
+| Code-smell detection        | single | binary F1 | MLCQ, Qualitas                                |
+| Commit classification       | single | macro F1  | CommitBench                                   |
+| Code-review acceptability   | pair   | binary F1 | CodeReview                                    |
+| Comment-code consistency    | pair   | binary F1 | comment-consistency datasets                  |
+| Exception-type prediction   | single | macro F1  | CodeXGLUE-Exception                           |
+| Type inference (closed)     | single | macro F1  | Typilus, Type4Py, ManyTypes4Py                |
+| **Custom** (any CSV)        | auto   | auto      | -                                             |
+
+`mergese tasks` (CLI) or `GET /api/tasks` (web) returns the same list.
+
+### Cross-task merging
+
+When models have differently-shaped classifier heads (e.g. a 2-class clone
+detector + a 10-class commit classifier), MergeSE auto-detects the mismatch
+and runs an **encoder-only** merge. The base's head is preserved so you can
+attach a fresh task-specific head downstream. Force this with
+`--encoder-only`, or override with `--include-heads`.
+
+---
+
+## Merge methods
+
+| Method       | Idea                                                                                           | Key options                          |
+|--------------|------------------------------------------------------------------------------------------------|--------------------------------------|
+| `average`    | Mean of the task vectors `θₖ - θ_base`.                                                         | `--weights`                          |
+| `ties`       | Trim small deltas, elect a per-parameter majority sign, sum only sign-agreeing entries.        | `--trim-percentile`, `--weights`     |
+| `dare-ties`  | Randomly drop a fraction of delta entries and rescale, then apply TIES.                         | `--drop-rate`, `--trim-percentile`   |
+| `wudi`       | Optimise each linear-layer delta to minimise cross-task interference; average the rest.        | `--wudi-steps`, `--wudi-lr`, `--device` |
+
+WUDI (Weight Disentanglement Interference minimisation) refines the merged
+weight of every linear layer so that it interferes as little as possible with
+each task's own update direction. Like the other methods it needs **no training
+data**; it runs a short per-layer optimisation instead. It is the most compute-
+intensive method - use `--device cuda` when a GPU is available.
+
+```bash
+mergese merge \
+    ./checkpoints/codebert_bcb \
+    ./checkpoints/codebert_clcdsa \
+    --base microsoft/codebert-base \
+    --method wudi --wudi-steps 300 --wudi-lr 1e-5 \
+    --output ./merged_wudi
+```
+
+---
+
+## Repository layout
+
+```
+MergeSE/
+├── mergese.py              # the entire CLI (single file)
+├── mergese_tasks.py        # task registry
+├── server/
+│   ├── app.py              # Flask backend
+│   └── presets.json        # example workflows
+├── frontend/
+│   ├── index.html
+│   ├── styles.css
+│   ├── app.js
+│   └── favicon.svg
+├── deploy/
+│   ├── provision.sh        # one-shot VM provisioning script
+│   ├── cloud-init.yaml     # first-boot user data for a fresh VM
+│   ├── nginx.conf          # reverse-proxy site
+│   ├── mergese.service     # systemd unit
+│   └── gunicorn.conf.py
+├── data/
+│   └── benchmarks/         # 200-row bundled samples + index.json
+├── tests/
+│   ├── test_merge_math.py
+│   ├── test_tasks_and_heads.py
+│   └── test_wudi.py
+├── docs/
+│   ├── CLI.md              # full CLI reference
+│   ├── WEB.md              # full web-tool reference
+│   └── DEPLOY.md           # VM deployment runbook
+├── pyproject.toml
+├── requirements.txt
+├── Dockerfile
+└── docker-compose.yml
+```
+
+---
+
+## Bundled benchmark samples
+
+| Name                       | Rows         | Task                                   | Source                                       |
+|----------------------------|--------------|----------------------------------------|----------------------------------------------|
+| `bundled://bigclonebench`  | 200 (100/100)| clone detection (Java)                 | CodeXGLUE / BigCloneBench                    |
+| `bundled://clcdsa`         | 200 (100/100)| cross-language clones (Java<->Python)    | CLCDSA Source Codes                          |
+| `bundled://gptclonebench`  | 200 (100/100)| semantic clones (Java)                 | GPTCloneBench standalone                     |
+
+These are sampled from the original benchmarks for smoke-testing only. For
+paper-grade numbers, point `--test-file` at the full dataset.
+
+---
+
+## Citing
+
+If you use MergeSE itself, please cite the tool paper:
+
+```bibtex
+@inproceedings{roy2026mergese,
+  author    = {Palash R. Roy and Banani Roy and Chanchal K. Roy and Kevin A. Schneider},
+  title     = {MergeSE: Post-hoc Model Merging for Software Engineering Tasks Without Retraining},
+  booktitle = {Proc. ASE Tool Track (under review)},
+  year      = {2026}
+}
+```
+
+If you use the merging methodology MergeSE packages, please also cite our
+research-track paper:
+
+```bibtex
+@inproceedings{roy2026unified,
+  author    = {Palash R. Roy and Banani Roy and Chanchal K. Roy and Kevin A. Schneider},
+  title     = {A Unified Model for Cross-Domain Clone Detection via Model Merging},
+  booktitle = {Proc. ASE (Under Review)},
+  year      = {2026}
+}
+```
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

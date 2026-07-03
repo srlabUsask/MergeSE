@@ -1,0 +1,144 @@
+{
+  "presets": [
+    {
+      "name": "Inspect CodeBERT pair",
+      "kind": "inspect",
+      "description": "Compare two CodeBERT checkpoints fine-tuned on different clone-detection benchmarks.",
+      "body": {
+        "models": [
+          "microsoft/codebert-base",
+          "microsoft/graphcodebert-base"
+        ],
+        "base": "microsoft/codebert-base"
+      }
+    },
+    {
+      "name": "TIES merge (clone detection)",
+      "kind": "merge",
+      "description": "TIES-Merging across three clone detectors. 20% trim, equal weights.",
+      "body": {
+        "models": [
+          "microsoft/codebert-base",
+          "microsoft/graphcodebert-base",
+          "microsoft/unixcoder-base"
+        ],
+        "base": "microsoft/codebert-base",
+        "method": "ties",
+        "trim_percentile": 20,
+        "drop_rate": 0.3,
+        "seed": 42,
+        "task": "clone_detection",
+        "encoder_only": false
+      }
+    },
+    {
+      "name": "DARE-TIES merge (vulnerability detection)",
+      "kind": "merge",
+      "description": "Merge two vulnerability detectors fine-tuned on Devign and ReVeal.",
+      "body": {
+        "models": [
+          "./checkpoints/codebert_devign",
+          "./checkpoints/codebert_reveal"
+        ],
+        "base": "microsoft/codebert-base",
+        "method": "dare-ties",
+        "trim_percentile": 20,
+        "drop_rate": 0.3,
+        "weights": "1,1",
+        "seed": 42,
+        "task": "vulnerability_detection",
+        "encoder_only": false
+      }
+    },
+    {
+      "name": "WUDI merge (clone detection)",
+      "kind": "merge",
+      "description": "WUDI-Merging across two clone detectors. Interference-minimising per-layer optimisation, 300 steps at lr 1e-5.",
+      "body": {
+        "models": [
+          "./checkpoints/codebert_bcb",
+          "./checkpoints/codebert_clcdsa"
+        ],
+        "base": "microsoft/codebert-base",
+        "method": "wudi",
+        "wudi_steps": 300,
+        "wudi_lr": 0.00001,
+        "weights": "1,1",
+        "seed": 42,
+        "task": "clone_detection",
+        "encoder_only": false
+      }
+    },
+    {
+      "name": "Cross-task merge: clone + vuln + defect",
+      "kind": "merge",
+      "description": "Encoder-only merge across three different SE tasks \u2014 classifier heads have different shapes so only the encoder is merged; downstream re-attach a fresh head.",
+      "body": {
+        "models": [
+          "./checkpoints/codebert_bcb",
+          "./checkpoints/codebert_devign",
+          "./checkpoints/codebert_defects4j"
+        ],
+        "base": "microsoft/codebert-base",
+        "method": "dare-ties",
+        "trim_percentile": 20,
+        "drop_rate": 0.3,
+        "weights": "1,1,1",
+        "seed": 42,
+        "encoder_only": true
+      }
+    },
+    {
+      "name": "Evaluate on BigCloneBench",
+      "kind": "evaluate",
+      "description": "Evaluate a merged clone detector on a BigCloneBench test CSV.",
+      "body": {
+        "model": "",
+        "task": "clone_detection",
+        "batch_size": 32,
+        "max_length": 512,
+        "metric": "binary",
+        "dataset_ref": "bundled://bigclonebench"
+      }
+    },
+    {
+      "name": "Evaluate on Devign",
+      "kind": "evaluate",
+      "description": "Vulnerability detection on the Devign test split.",
+      "body": {
+        "model": "",
+        "task": "vulnerability_detection",
+        "batch_size": 32,
+        "max_length": 400,
+        "metric": "binary",
+        "dataset_ref": "hf-dataset://google/code_x_glue_cc_defect_detection#split=test"
+      }
+    },
+    {
+      "name": "Evaluate on Defects4J",
+      "kind": "evaluate",
+      "description": "Defect prediction on a Defects4J-derived classification CSV.",
+      "body": {
+        "model": "",
+        "task": "defect_prediction",
+        "batch_size": 32,
+        "max_length": 512,
+        "metric": "binary",
+        "dataset_ref": ""
+      }
+    },
+    {
+      "name": "Evaluate on CommitBench (multi-class)",
+      "kind": "evaluate",
+      "description": "Commit-message classification (fix / feat / refactor / \u2026). Macro-F1.",
+      "body": {
+        "model": "",
+        "task": "commit_classification",
+        "batch_size": 32,
+        "max_length": 256,
+        "metric": "macro",
+        "dataset_ref": ""
+      }
+    }
+  ]
+}
