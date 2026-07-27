@@ -45,6 +45,7 @@ import json
 import os
 import re
 import shlex
+import resource
 import shutil
 import signal
 import subprocess
@@ -66,6 +67,11 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 FRONTEND = ROOT / "frontend"
 
+# Ensure sibling modules (auth.py) import cleanly no matter how app.py is
+# launched - `python server/app.py`, gunicorn, or importlib-by-path in tests.
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
 # ---- config from env ---------------------------------------------------------
 
 MERGESE_BIN = os.environ.get("MERGESE_BIN", sys.executable + " " + str(ROOT / "mergese.py"))
@@ -83,6 +89,72 @@ MAX_QUEUE = int(os.environ.get("MERGESE_MAX_QUEUE", str(MAX_CONCURRENT * 4)))
 # 6× headroom for larger encoders / zipped multi-file checkpoints).
 MAX_UPLOAD_BYTES = int(os.environ.get("MERGESE_MAX_UPLOAD_BYTES", str(3 * 1024 ** 3)))
 ALLOW_LOCAL_PATHS = bool(int(os.environ.get("MERGESE_ALLOW_LOCAL_PATHS", "0")))
+# Uploaded checkpoints are deserialized by the merge worker. PyTorch `.bin`
+# checkpoints are Python pickles and can execute arbitrary code on load, so by
+# default we accept only tensor-only safetensors weights and refuse pickle
+# formats outright. An operator who fully trusts their users can flip this, but
+# it should stay off for any publicly reachable deployment.
+ALLOW_PICKLE_UPLOADS = bool(int(os.environ.get("MERGESE_ALLOW_PICKLE_UPLOADS", "0")))
+# Zip-bomb defenses for uploaded archives: cap the total uncompressed size, the
+# number of entries, and the per-entry compression ratio. Defaults give ample
+# room for a sharded multi-file encoder while refusing pathological archives.
+MAX_UNCOMPRESSED_BYTES = int(os.environ.get(
+    "MERGESE_MAX_UNCOMPRESSED_BYTES", str(12 * 1024 ** 3)))
+MAX_ARCHIVE_ENTRIES = int(os.environ.get("MERGESE_MAX_ARCHIVE_ENTRIES", "10000"))
+MAX_COMPRESSION_RATIO = float(os.environ.get("MERGESE_MAX_COMPRESSION_RATIO", "200"))
+# File extensions that carry executable pickle payloads or code. Refused on
+# upload unless ALLOW_PICKLE_UPLOADS is set.
+_PICKLE_EXTS = {".bin", ".pkl", ".pickle", ".pt", ".pth", ".ckpt", ".npy", ".npz",
+                ".joblib", ".dill", ".model", ".h5", ".msgpack"}
+_CODE_EXTS = {".py", ".pyc", ".pyo", ".so", ".sh", ".pyd", ".dll", ".dylib"}
+
+# ---- worker sandbox config ---------------------------------------------------
+# Each job runs in a hardened child process: a stripped environment, a
+# job-private HOME/TMPDIR, POSIX rlimits, a hard wall-clock timeout, and - when
+# the host supports an unprivileged network namespace - no network at all.
+WORKER_TIMEOUT_SEC = int(os.environ.get("MERGESE_WORKER_TIMEOUT_SEC", "3600"))
+WORKER_CPU_SEC = int(os.environ.get("MERGESE_WORKER_CPU_SEC", "3600"))
+# Max bytes any single file the job writes may reach (RLIMIT_FSIZE). Guards
+# against a job filling the disk with one enormous output. 20 GB default.
+WORKER_MAX_FILE_BYTES = int(os.environ.get(
+    "MERGESE_WORKER_MAX_FILE_BYTES", str(20 * 1024 ** 3)))
+# Process/thread cap (RLIMIT_NPROC). Off by default (0): on Linux this counts
+# EVERY process owned by the real uid, not just this job, so on a shared host a
+# busy user trips it and torch fails with "can't start new thread". Reliable
+# per-job PID limiting needs cgroups (pids.max), which requires privilege we do
+# not assume here. Set a value only on a single-tenant box.
+WORKER_MAX_NPROC = int(os.environ.get("MERGESE_WORKER_MAX_NPROC", "0"))
+# Virtual-address-space cap (RLIMIT_AS) in bytes. 0 disables it: CUDA/torch
+# reserve enormous virtual ranges, so an AS cap causes spurious OOM on GPU
+# hosts. Leave at 0 unless you are on a CPU-only box and want a hard ceiling.
+WORKER_AS_BYTES = int(os.environ.get("MERGESE_WORKER_AS_BYTES", "0"))
+# Run the merge worker with no network. Default on: a merge of uploaded or
+# already-cached checkpoints needs no network, and denying it removes the whole
+# SSRF / network-probing surface. Turn off only if you accept on-demand Hub
+# fetches from inside the worker.
+WORKER_OFFLINE = bool(int(os.environ.get("MERGESE_WORKER_OFFLINE", "1")))
+_UNSHARE_BIN = shutil.which("unshare")
+
+
+def _probe_netns() -> bool:
+    """True if this host can create an unprivileged network namespace.
+
+    We shell out once at startup rather than trusting a config flag, because a
+    namespace we cannot actually create would make every job fail to launch.
+    """
+    if not (_UNSHARE_BIN and WORKER_OFFLINE):
+        return False
+    try:
+        r = subprocess.run([_UNSHARE_BIN, "-rn", "--", "true"],
+                           stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+NETNS_OK = _probe_netns()
 # Time-to-live for uploaded checkpoints, uploaded datasets, and job artifacts.
 # A background janitor removes anything older so the disk cannot be filled.
 UPLOAD_TTL_HOURS = float(os.environ.get("MERGESE_UPLOAD_TTL_HOURS", "48"))
@@ -92,6 +164,33 @@ JANITOR_ENABLED = bool(int(os.environ.get("MERGESE_JANITOR", "1")))
 ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
 UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
 DATASET_UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+# ---- auth config -------------------------------------------------------------
+# All OFF by default so a trusted single-tenant deployment is unchanged. For a
+# public deployment set MERGESE_REQUIRE_AUTH=1 (and a Turnstile secret if you
+# want anonymous website access).
+REQUIRE_AUTH = bool(int(os.environ.get("MERGESE_REQUIRE_AUTH", "0")))
+# Emergency switch: refuse anonymous tokens and require an API key, without a
+# redeploy. Set MERGESE_DISABLE_ANON=1 if the public endpoint is being abused.
+DISABLE_ANON = bool(int(os.environ.get("MERGESE_DISABLE_ANON", "0")))
+ADMIN_TOKEN = os.environ.get("MERGESE_ADMIN_TOKEN", "")
+TURNSTILE_SECRET = os.environ.get("MERGESE_TURNSTILE_SECRET", "")
+AUTH_DB = Path(os.environ.get("MERGESE_AUTH_DB", str(ARTIFACTS_ROOT / "_auth" / "auth.db")))
+ANON_TTL_SEC = int(os.environ.get("MERGESE_ANON_TTL_SEC", "3600"))
+
+_AUTH = None  # lazily created AuthStore
+
+
+def _auth_store():
+    global _AUTH
+    if _AUTH is None:
+        import auth as _authmod
+        secret = _authmod.load_secret(
+            os.environ.get("MERGESE_AUTH_SECRET"),
+            AUTH_DB.parent / "signing.secret")
+        _AUTH = _authmod.AuthStore(AUTH_DB, secret, anon_ttl_sec=ANON_TTL_SEC)
+    return _AUTH
 
 
 def _load_benchmarks_index() -> dict:
@@ -122,6 +221,13 @@ class Job:
     log_path: Path = field(default_factory=Path)
     result_path: Optional[Path] = None
     error: Optional[str] = None
+    # True when the job must reach the network (e.g. an uncached HuggingFace
+    # Hub id). Such a job cannot run in the offline namespace; it is refused
+    # unless the operator has explicitly allowed a networked worker.
+    needs_network: bool = False
+    # Identity that submitted the job (None when auth is disabled). Used to keep
+    # one caller from reading, cancelling, or downloading another's job.
+    owner: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -160,6 +266,69 @@ def _capacity_response():
             "retry_after_sec": 30,
         }), 429
     return None
+
+
+# ---- authentication middleware ----------------------------------------------
+
+def _bearer_token() -> Optional[str]:
+    h = request.headers.get("Authorization", "")
+    if h.startswith("Bearer "):
+        return h[len("Bearer "):].strip()
+    return None
+
+
+def _resolve_client():
+    """Resolve the calling identity for this request.
+
+    Returns an auth.Client, or None when auth is disabled (trusted single-tenant
+    mode). Raises auth.AuthError when auth is required and the caller is not
+    valid; the registered error handler turns that into a JSON response.
+    """
+    if not REQUIRE_AUTH:
+        return None
+    import auth as _authmod
+    token = _bearer_token()
+    api_key = token if (token and token.startswith(_authmod.KEY_PREFIX)) else None
+    anon = request.headers.get("X-Anon-Token") or (token if not api_key else None)
+    if anon and DISABLE_ANON:
+        # Emergency mode: only API keys are accepted.
+        if not api_key:
+            raise _authmod.AuthError(
+                403, "anonymous access is temporarily disabled; use an API key")
+    client = _auth_store().authenticate(api_key, None if DISABLE_ANON else anon)
+    return client
+
+
+def _client_active_jobs(client_id: str) -> int:
+    with JOBS_LOCK:
+        return sum(1 for j in JOBS.values()
+                   if j.owner == client_id and j.status in ("pending", "running"))
+
+
+def _authorize_job_submission():
+    """Authenticate + enforce per-caller quotas for a job-creating request.
+
+    Returns the owner id to stamp on the job (None when auth is off). Raises
+    auth.AuthError on any auth/quota failure.
+    """
+    client = _resolve_client()
+    if client is None:
+        return None
+    _auth_store().check_and_reserve(client, _client_active_jobs(client.client_id))
+    return client.client_id
+
+
+def _require_owner(job: "Job") -> None:
+    """404 unless the current caller owns `job` (no-op when auth is off).
+
+    Returns 404 rather than 403 so the existence of another caller's job is not
+    revealed.
+    """
+    if not REQUIRE_AUTH:
+        return
+    client = _resolve_client()
+    if client is None or job.owner != client.client_id:
+        abort(404)
 
 
 # ---- model-reference resolution ---------------------------------------------
@@ -416,7 +585,8 @@ def _allocate_job_id() -> Tuple[str, Path]:
 
 def _new_job(kind: str, cli_args: List[str], params: dict,
              result_basename: Optional[str] = None,
-             job_id: Optional[str] = None) -> Job:
+             job_id: Optional[str] = None,
+             owner: Optional[str] = None) -> Job:
     if job_id is None:
         job_id, job_dir = _allocate_job_id()
     else:
@@ -437,6 +607,8 @@ def _new_job(kind: str, cli_args: List[str], params: dict,
         params=params,
         log_path=log_path,
         result_path=result_path,
+        needs_network=_cmd_needs_network(cmd),
+        owner=owner,
     )
     with JOBS_LOCK:
         JOBS[job_id] = job
@@ -444,25 +616,156 @@ def _new_job(kind: str, cli_args: List[str], params: dict,
     return job
 
 
+def _hf_cache_root() -> Path:
+    home = os.environ.get("HF_HOME")
+    if home:
+        return Path(home) / "hub"
+    legacy = os.environ.get("TRANSFORMERS_CACHE")
+    if legacy:
+        return Path(legacy)
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _hf_id_is_cached(hf_id: str) -> bool:
+    """True if a HuggingFace Hub id already has a local snapshot.
+
+    Uses the standard `models--org--name` cache layout so we can tell an
+    offline-runnable job (cached) from one that would need a Hub download.
+    """
+    folder = "models--" + hf_id.replace("/", "--")
+    snap = _hf_cache_root() / folder / "snapshots"
+    return snap.is_dir() and any(snap.iterdir())
+
+
+def _cmd_needs_network(cmd: List[str]) -> bool:
+    """Does this resolved command reference an uncached Hub id?
+
+    Resolved local refs are absolute paths; a bare `org/model` token that is
+    neither an existing path nor already cached implies a Hub download, which
+    the offline worker cannot perform.
+    """
+    for tok in cmd:
+        if tok.startswith("-") or os.path.isabs(tok) or os.sep in tok and Path(tok).exists():
+            continue
+        if _HF_ID.match(tok) and "/" in tok and not Path(tok).exists():
+            if not _hf_id_is_cached(tok):
+                return True
+    return False
+
+
+def _rlimit_preexec():
+    """Applied in the worker child before exec: rlimits + new session.
+
+    A new session (setsid) puts the worker in its own process group so a
+    timeout can kill the whole tree, including any threads/children it spawned.
+    """
+    os.setsid()
+    def _set(res, soft):
+        try:
+            hard = resource.getrlimit(res)[1]
+            cap = soft if hard == resource.RLIM_INFINITY else min(soft, hard)
+            resource.setrlimit(res, (cap, hard))
+        except (ValueError, OSError):
+            pass
+    if WORKER_CPU_SEC > 0:
+        _set(resource.RLIMIT_CPU, WORKER_CPU_SEC)
+    if WORKER_MAX_FILE_BYTES > 0:
+        _set(resource.RLIMIT_FSIZE, WORKER_MAX_FILE_BYTES)
+    if WORKER_MAX_NPROC > 0:
+        _set(resource.RLIMIT_NPROC, WORKER_MAX_NPROC)
+    if WORKER_AS_BYTES > 0:
+        _set(resource.RLIMIT_AS, WORKER_AS_BYTES)
+
+
+def _build_worker(job: Job, logf) -> subprocess.Popen:
+    """Launch the CLI for `job` in a hardened child process."""
+    job_dir = ARTIFACTS_ROOT / job.id
+    home = job_dir / "home"
+    tmp = job_dir / "tmp"
+    home.mkdir(parents=True, exist_ok=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+
+    # Stripped environment: only what the merge CLI actually needs. The full
+    # server environment (secrets, DB URLs, tokens) is never inherited.
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(home),
+        "TMPDIR": str(tmp),
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONNOUSERSITE": "1",
+        "FORCE_COLOR": "0",
+        "NO_COLOR": "1",
+        "TERM": "dumb",
+    }
+    # Read-only access to the shared model cache so already-fetched encoders
+    # resolve offline. Passing the path grants read of the cache, not network.
+    for k in ("HF_HOME", "TRANSFORMERS_CACHE", "HF_DATASETS_CACHE"):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    if WORKER_OFFLINE:
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
+
+    cmd = list(job.cmd)
+    # No network unless the operator has opted out of offline mode. The
+    # namespace also blocks localhost, so the worker cannot reach the Flask
+    # service, a database, or cloud metadata endpoints.
+    if WORKER_OFFLINE and NETNS_OK:
+        cmd = [_UNSHARE_BIN, "-rn", "--", *cmd]
+
+    return subprocess.Popen(
+        cmd,
+        stdout=logf,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        cwd=str(job_dir),          # job-private working dir, never the app source
+        env=env,
+        preexec_fn=_rlimit_preexec,
+        close_fds=True,
+    )
+
+
 def _run_job(job: Job) -> None:
     with RUN_SEMA:
+        # A job that needs a Hub download cannot run in the offline namespace.
+        # Refuse it up front with an actionable message rather than letting it
+        # fail deep inside transformers with an opaque offline error.
+        if job.needs_network and WORKER_OFFLINE and NETNS_OK:
+            with JOBS_LOCK:
+                job.status = "error"
+                job.started_at = job.started_at or time.time()
+                job.finished_at = time.time()
+                job.error = ("this job references a HuggingFace model that is not "
+                             "cached on the server. The merge worker runs offline, "
+                             "so ask the operator to pre-fetch the model, or upload "
+                             "safetensors weights directly.")
+            try:
+                job.log_path.write_text("[mergese] refused: model not available "
+                                        "offline (worker has no network).\n")
+            except OSError:
+                pass
+            return
         with JOBS_LOCK:
             job.status = "running"
             job.started_at = time.time()
         try:
             with open(job.log_path, "wb", buffering=0) as logf:
-                proc = subprocess.Popen(
-                    job.cmd,
-                    stdout=logf,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(ROOT),
-                    env={**os.environ, "PYTHONUNBUFFERED": "1", "FORCE_COLOR": "0",
-                         "NO_COLOR": "1", "TERM": "dumb"},
-                )
+                proc = _build_worker(job, logf)
                 with JOBS_LOCK:
                     job.pid = proc.pid
                     JOB_PROCS[job.id] = proc
-                rc = proc.wait()
+                try:
+                    rc = proc.wait(timeout=WORKER_TIMEOUT_SEC)
+                except subprocess.TimeoutExpired:
+                    _kill_proc_group(proc)
+                    rc = proc.wait()
+                    with JOBS_LOCK:
+                        job.status = "error"
+                        job.error = f"job exceeded the {WORKER_TIMEOUT_SEC}s time limit"
+                        job.finished_at = time.time()
+                    logf.write(f"\n[mergese] killed: exceeded {WORKER_TIMEOUT_SEC}s limit\n"
+                               .encode())
+                    return
                 with JOBS_LOCK:
                     job.exit_code = rc
                     job.finished_at = time.time()
@@ -481,6 +784,20 @@ def _run_job(job: Job) -> None:
         finally:
             with JOBS_LOCK:
                 JOB_PROCS.pop(job.id, None)
+
+
+def _kill_proc_group(proc: subprocess.Popen) -> None:
+    """SIGTERM then SIGKILL the worker's whole process group."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def _tail_stream(job: Job):
@@ -563,11 +880,12 @@ def api_inspect():
         resolved_base = resolve_model_ref(base) if base else None
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    owner = _authorize_job_submission()
     args = ["inspect", *resolved_models]
     if resolved_base:
         args.extend(["--base", resolved_base])
     job = _new_job("inspect", args, {"models": models, "base": base},
-                   result_basename="report.json")
+                   result_basename="report.json", owner=owner)
     return jsonify({"job_id": job.id, "status": job.status}), 202
 
 
@@ -583,6 +901,9 @@ def api_merge():
     drop_rate = body.get("drop_rate", 0.3)
     wudi_steps = body.get("wudi_steps")
     wudi_lr = body.get("wudi_lr")
+    pcb_ratio = body.get("pcb_ratio")
+    pcb_lambda = body.get("pcb_lambda")
+    pcb_scope = body.get("pcb_scope")
     weights = body.get("weights")
     seed = body.get("seed", 42)
     task = body.get("task") or ""
@@ -599,6 +920,7 @@ def api_merge():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
+    owner = _authorize_job_submission()
     job_id, job_dir = _allocate_job_id()
     out_dir = job_dir / "merged"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -614,6 +936,12 @@ def api_merge():
         args.extend(["--wudi-steps", str(wudi_steps)])
     if wudi_lr is not None:
         args.extend(["--wudi-lr", str(wudi_lr)])
+    if pcb_ratio is not None:
+        args.extend(["--pcb-ratio", str(pcb_ratio)])
+    if pcb_lambda is not None:
+        args.extend(["--pcb-lambda", str(pcb_lambda)])
+    if pcb_scope:
+        args.extend(["--pcb-scope", str(pcb_scope)])
     if weights:
         args.extend(["--weights", weights])
     if task:
@@ -623,7 +951,7 @@ def api_merge():
     elif encoder_only is False:
         args.append("--include-heads")
 
-    job = _new_job("merge", args, body, job_id=job_id)
+    job = _new_job("merge", args, body, job_id=job_id, owner=owner)
     job.artifacts["output_dir"] = str(out_dir)
     return jsonify({"job_id": job.id, "status": job.status, "output_dir": str(out_dir)}), 202
 
@@ -651,6 +979,7 @@ def api_evaluate():
         resolved_model = resolve_model_ref(model)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    owner = _authorize_job_submission()
 
     # Unified dataset reference handling: the frontend sends one `dataset_ref`
     # using bundled:// / dataset:// / hf-dataset:// / server-dataset://. Older
@@ -674,7 +1003,7 @@ def api_evaluate():
         if test_file:
             args.extend(["--test-file", test_file])
 
-    job = _new_job("evaluate", args, body, result_basename="metrics.json")
+    job = _new_job("evaluate", args, body, result_basename="metrics.json", owner=owner)
     return jsonify({"job_id": job.id, "status": job.status}), 202
 
 
@@ -696,6 +1025,7 @@ def api_export():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
+    owner = _authorize_job_submission()
     job_id, base_out = _allocate_job_id()
     if fmt == "huggingface":
         out_path = base_out / "exported"
@@ -705,7 +1035,7 @@ def api_export():
         out_path = base_out / "model.pt"
 
     args = ["export", resolved_model, "--format", fmt, "--output", str(out_path)]
-    job = _new_job("export", args, body, job_id=job_id)
+    job = _new_job("export", args, body, job_id=job_id, owner=owner)
     job.artifacts["output"] = str(out_path)
     return jsonify({"job_id": job.id, "status": job.status, "output": str(out_path)}), 202
 
@@ -714,8 +1044,14 @@ def api_export():
 
 @app.route("/api/jobs")
 def api_jobs():
+    # When auth is on, callers see only their own jobs.
+    owner = None
+    if REQUIRE_AUTH:
+        client = _resolve_client()
+        owner = client.client_id if client else "\x00none"
     with JOBS_LOCK:
-        items = [j.to_dict() for j in JOBS.values()]
+        items = [j.to_dict() for j in JOBS.values()
+                 if owner is None or j.owner == owner]
     items.sort(key=lambda x: x.get("started_at") or 0, reverse=True)
     return jsonify({"jobs": items})
 
@@ -726,6 +1062,7 @@ def api_job(job_id: str):
         job = JOBS.get(job_id)
     if not job:
         abort(404)
+    _require_owner(job)
     return jsonify(job.to_dict())
 
 
@@ -735,6 +1072,7 @@ def api_job_stream(job_id: str):
         job = JOBS.get(job_id)
     if not job:
         abort(404)
+    _require_owner(job)
     return Response(_tail_stream(job), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
                              "X-Accel-Buffering": "no"})
@@ -746,6 +1084,7 @@ def api_job_result(job_id: str):
         job = JOBS.get(job_id)
     if not job:
         abort(404)
+    _require_owner(job)
     if not job.result_path or not job.result_path.exists():
         return jsonify({"status": job.status, "result": None}), 200
     try:
@@ -761,6 +1100,7 @@ def api_job_log(job_id: str):
         job = JOBS.get(job_id)
     if not job:
         abort(404)
+    _require_owner(job)
     if not job.log_path.exists():
         return Response("", mimetype="text/plain")
     return Response(job.log_path.read_text(errors="replace"), mimetype="text/plain")
@@ -773,16 +1113,18 @@ def api_job_cancel(job_id: str):
         proc = JOB_PROCS.get(job_id)
     if not job:
         abort(404)
+    _require_owner(job)
     if proc and proc.poll() is None:
         try:
-            proc.send_signal(signal.SIGTERM)
-            time.sleep(1.0)
-            if proc.poll() is None:
-                proc.kill()
+            # The worker runs in its own session (see _rlimit_preexec), so we
+            # signal the whole process group - killing just the unshare parent
+            # would orphan the python child doing the actual merge.
+            with JOBS_LOCK:
+                job.status = "cancelled"
+            _kill_proc_group(proc)
         except Exception as e:
             return jsonify({"error": str(e)}), 500
         with JOBS_LOCK:
-            job.status = "cancelled"
             job.finished_at = time.time()
         return jsonify({"ok": True, "status": "cancelled"})
     return jsonify({"ok": False, "status": job.status})
@@ -856,17 +1198,46 @@ def _upload_dir(token: str) -> Path:
     return UPLOADS_ROOT / token
 
 
+def _scan_unsafe_files(p: Path) -> Optional[str]:
+    """Reject uploads carrying pickle checkpoints or executable code.
+
+    The merge worker deserializes whatever weights it is handed. Pickle-backed
+    formats (`.bin`, `.pt`, `.ckpt`, ...) run arbitrary code on load, and code
+    files (`.py`, `.so`, ...) have no place in a tensor-only checkpoint. Unless
+    an operator has explicitly opted into pickle uploads, both are refused here,
+    before anything ever loads them. Returns an error string, or None if clean.
+    """
+    if ALLOW_PICKLE_UPLOADS:
+        return None
+    for f in p.rglob("*"):
+        if not f.is_file():
+            continue
+        ext = f.suffix.lower()
+        if ext in _PICKLE_EXTS:
+            return (f"refusing {f.name}: pickle-based checkpoints can execute code "
+                    f"on load. Upload safetensors weights (model.safetensors) instead.")
+        if ext in _CODE_EXTS:
+            return (f"refusing {f.name}: executable/code files are not allowed in a "
+                    f"checkpoint upload.")
+    return None
+
+
 def _validate_hf_dir(p: Path) -> Optional[str]:
-    """Return None if `p` looks like an HF checkpoint dir, else an error message."""
+    """Return None if `p` looks like a safe HF checkpoint dir, else an error."""
     if not (p / "config.json").exists():
         return f"missing config.json in {p.name}"
-    has_weights = any((p / f).exists() for f in
-                      ("model.safetensors", "pytorch_model.bin"))
+    # Safe-format gate first: an uploaded pickle checkpoint must never reach the
+    # loader, even if it also ships valid safetensors alongside.
+    unsafe = _scan_unsafe_files(p)
+    if unsafe:
+        return unsafe
+    has_weights = (p / "model.safetensors").exists() or any(p.glob("model-*.safetensors"))
+    if not has_weights and ALLOW_PICKLE_UPLOADS:
+        has_weights = (p / "pytorch_model.bin").exists() or any(p.glob("pytorch_model-*.bin"))
     if not has_weights:
-        # sharded? look for at least one shard
-        has_weights = any(p.glob("model-*.safetensors")) or any(p.glob("pytorch_model-*.bin"))
-    if not has_weights:
-        return f"no model weights found in {p.name} (expected model.safetensors or pytorch_model.bin)"
+        return (f"no safetensors weights found in {p.name} (expected "
+                f"model.safetensors). Convert pickle .bin checkpoints to "
+                f"safetensors before uploading.")
     return None
 
 
@@ -877,10 +1248,27 @@ def _safe_zip_extract(zf: zipfile.ZipFile, dest: Path) -> Tuple[Optional[str], L
     """
     dest = dest.resolve()
     extracted: List[str] = []
-    for member in zf.infolist():
+    members = [m for m in zf.infolist() if not m.filename.endswith("/")]
+    # Zip-bomb guard 1: entry count.
+    if len(members) > MAX_ARCHIVE_ENTRIES:
+        return (f"archive has too many entries ({len(members)} > "
+                f"{MAX_ARCHIVE_ENTRIES})"), extracted
+    # Zip-bomb guard 2: declared uncompressed total. This reads the central
+    # directory only, so it rejects a bomb before a single byte is written.
+    total_uncompressed = sum(max(m.file_size, 0) for m in members)
+    if total_uncompressed > MAX_UNCOMPRESSED_BYTES:
+        return (f"archive expands to {total_uncompressed} bytes, over the "
+                f"{MAX_UNCOMPRESSED_BYTES}-byte limit"), extracted
+    written = 0
+    for member in members:
         name = member.filename
-        if name.endswith("/"):  # directory entry
-            continue
+        # Zip-bomb guard 3: per-entry compression ratio (catches a small entry
+        # whose header lies about file_size, or a highly compressible payload).
+        if member.compress_size > 0:
+            ratio = member.file_size / member.compress_size
+            if ratio > MAX_COMPRESSION_RATIO:
+                return (f"zip entry {name!r} has a suspicious compression ratio "
+                        f"({ratio:.0f}:1)"), extracted
         # Strip Windows drive letters and leading slashes
         clean = name.replace("\\", "/").lstrip("/")
         if ".." in clean.split("/"):
@@ -889,8 +1277,19 @@ def _safe_zip_extract(zf: zipfile.ZipFile, dest: Path) -> Tuple[Optional[str], L
         if not str(target).startswith(str(dest)):
             return f"zip entry escapes extraction directory: {name!r}", extracted
         target.parent.mkdir(parents=True, exist_ok=True)
+        # Zip-bomb guard 4: enforce the running total during the copy, so a
+        # lying header cannot slip a bomb past the pre-check above.
         with zf.open(member, "r") as src, open(target, "wb") as out:
-            shutil.copyfileobj(src, out)
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UNCOMPRESSED_BYTES:
+                    out.close()
+                    return (f"archive exceeded the {MAX_UNCOMPRESSED_BYTES}-byte "
+                            f"uncompressed limit during extraction"), extracted
+                out.write(chunk)
         extracted.append(clean)
     return None, extracted
 
@@ -921,6 +1320,7 @@ def api_upload():
 
     Returns: { token, ref: "upload://<token>", size, files: [...] }
     """
+    _resolve_client()  # require a valid identity when auth is on
     label = secure_filename((request.form.get("label") or "").strip())[:64] or None
 
     if "file" in request.files:
@@ -950,8 +1350,10 @@ def api_upload():
                 shutil.rmtree(d, ignore_errors=True)
                 return jsonify({
                     "error": err,
-                    "hint": "ZIP a folder that contains config.json and either "
-                            "model.safetensors or pytorch_model.bin (plus the tokenizer files).",
+                    "hint": "ZIP a folder that contains config.json and "
+                            "model.safetensors (plus the tokenizer files). "
+                            "Pickle .bin checkpoints are refused by default; "
+                            "convert them with safetensors first.",
                 }), 400
 
             size = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
@@ -982,6 +1384,13 @@ def api_upload():
                 name = secure_filename(f.filename or "")
                 if not name:
                     continue
+                ext = Path(name).suffix.lower()
+                if not ALLOW_PICKLE_UPLOADS and (ext in _PICKLE_EXTS or ext in _CODE_EXTS):
+                    shutil.rmtree(d, ignore_errors=True)
+                    return jsonify({
+                        "error": f"refusing {name}: pickle checkpoints and code files "
+                                 f"are not allowed. Upload model.safetensors instead.",
+                    }), 400
                 f.save(str(d / name))
             err = _validate_hf_dir(d)
             if err:
@@ -1279,6 +1688,7 @@ def api_job_download(job_id: str):
         job = JOBS.get(job_id)
     if not job:
         abort(404)
+    _require_owner(job)
 
     # Pick the right artifact directory:
     #   merge   -> artifacts/<id>/merged
@@ -1389,6 +1799,76 @@ def _start_janitor() -> None:
 _start_janitor()
 
 
+# ---- auth endpoints (/api/v1) ------------------------------------------------
+
+@app.route("/api/v1/anon-token", methods=["POST"])
+def api_anon_token():
+    """Issue a short-lived anonymous token after a bot challenge.
+
+    When a Turnstile secret is configured the caller must pass a valid
+    `cf_turnstile_response`; otherwise (dev / trusted networks) a token is
+    issued freely. The emergency switch MERGESE_DISABLE_ANON refuses all of
+    these without a redeploy.
+    """
+    if not REQUIRE_AUTH:
+        return jsonify({"error": "auth is disabled on this server"}), 400
+    if DISABLE_ANON:
+        return jsonify({"error": "anonymous access is temporarily disabled; "
+                                 "use an API key"}), 403
+    if TURNSTILE_SECRET:
+        import auth as _authmod
+        body = request.get_json(silent=True) or {}
+        tok = body.get("cf_turnstile_response") or request.form.get("cf_turnstile_response")
+        if not tok or not _authmod.verify_turnstile(
+                TURNSTILE_SECRET, tok, request.remote_addr):
+            return jsonify({"error": "bot challenge failed"}), 403
+    token, exp = _auth_store().issue_anon_token()
+    return jsonify({"token": token, "expires_at": exp,
+                    "token_type": "anon", "usage_header": "X-Anon-Token"})
+
+
+@app.route("/api/v1/keys", methods=["POST"])
+def api_mint_key():
+    """Admin-only: mint an API key. Guarded by MERGESE_ADMIN_TOKEN.
+
+    The plaintext key is returned exactly once and never stored; only its hash
+    is persisted.
+    """
+    if not ADMIN_TOKEN or _bearer_token() != ADMIN_TOKEN:
+        abort(404)  # do not advertise the admin surface
+    import auth as _authmod
+    body = request.get_json(silent=True) or {}
+    tier = body.get("tier", "key")
+    email = body.get("email")
+    daily_limit = body.get("daily_limit")
+    try:
+        client_id, plaintext = _auth_store().mint_key(email, tier, daily_limit)
+    except _authmod.AuthError as e:
+        return jsonify({"error": e.message}), e.status
+    return jsonify({"client_id": client_id, "api_key": plaintext, "tier": tier,
+                    "note": "store this key now; it will not be shown again"}), 201
+
+
+@app.route("/api/v1/keys/<client_id>", methods=["DELETE"])
+def api_revoke_key(client_id: str):
+    if not ADMIN_TOKEN or _bearer_token() != ADMIN_TOKEN:
+        abort(404)
+    ok = _auth_store().revoke_key(client_id)
+    return jsonify({"revoked": ok}), (200 if ok else 404)
+
+
+@app.route("/api/v1/limits", methods=["GET"])
+def api_limits():
+    """Report the caller's quota and current usage."""
+    if not REQUIRE_AUTH:
+        return jsonify({"auth": "disabled",
+                        "note": "this server accepts unauthenticated requests"})
+    client = _resolve_client()
+    usage = _auth_store().usage(client)
+    usage["active_jobs"] = _client_active_jobs(client.client_id)
+    return jsonify(usage)
+
+
 # ---- error handlers ----------------------------------------------------------
 
 @app.errorhandler(413)
@@ -1398,6 +1878,17 @@ def too_large(e):
         "max_upload_bytes": MAX_UPLOAD_BYTES,
         "hint": "Increase MERGESE_MAX_UPLOAD_BYTES on the server, or split the upload.",
     }), 413
+
+
+def _register_auth_error_handler():
+    import auth as _authmod
+
+    @app.errorhandler(_authmod.AuthError)
+    def _auth_error(e):  # noqa: ANN001
+        return jsonify({"error": e.message}), e.status
+
+
+_register_auth_error_handler()
 
 
 # ---- main --------------------------------------------------------------------

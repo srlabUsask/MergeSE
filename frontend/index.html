@@ -41,7 +41,7 @@
       <span class="spin"></span>
       <span id="runningPillText">0 running</span>
     </a>
-    <a href="https://github.com/" id="ghLink" class="gh-link" target="_blank" rel="noopener">GitHub</a>
+    <a href="https://github.com/srlabUsask/MergeSE" id="ghLink" class="gh-link" target="_blank" rel="noopener">GitHub</a>
   </nav>
 </header>
 
@@ -211,6 +211,7 @@
           <option value="ties" selected>TIES</option>
           <option value="dare-ties">DARE-TIES</option>
           <option value="wudi">WUDI</option>
+          <option value="pcb">PCB</option>
           <option value="average">Average</option>
         </select>
       </label>
@@ -233,6 +234,24 @@
         <span>WUDI learning rate</span>
         <input id="mWudiLr" type="number" min="0" max="1" step="0.00001" value="0.00001" />
         <small id="mWudiLrHint" class="hint-inline"></small>
+      </label>
+      <label>
+        <span>PCB keep ratio</span>
+        <input id="mPcbRatio" type="number" min="0.01" max="1" step="0.01" value="0.1" />
+        <small id="mPcbRatioHint" class="hint-inline"></small>
+      </label>
+      <label>
+        <span>PCB lambda</span>
+        <input id="mPcbLambda" type="number" min="0" max="10" step="0.1" value="1" />
+        <small id="mPcbLambdaHint" class="hint-inline"></small>
+      </label>
+      <label>
+        <span>PCB scope</span>
+        <select id="mPcbScope">
+          <option value="global" selected>Global (whole task vector)</option>
+          <option value="tensor">Per tensor</option>
+        </select>
+        <small id="mPcbScopeHint" class="hint-inline"></small>
       </label>
       <label>
         <span>Weights (comma-separated, optional)</span>
@@ -395,6 +414,10 @@
       <div>
         <h3>DARE-TIES</h3>
         <p>Randomly drop a fraction <code>p</code> of Δ entries and rescale by <code>1/(1-p)</code>, then apply TIES. Adds a sparsity prior, often improving merges of 3+ models.</p>
+      </div>
+      <div>
+        <h3>PCB</h3>
+        <p>Score every <code>(task, parameter)</code> pair by <em>intra-balancing</em> - how much it matters inside its own Δ<sub>k</sub> - times <em>inter-balancing</em> - whether it pulls with or against the cross-task consensus. Keep only the top-scoring fraction and combine them score-weighted. Parameters that fight the consensus are dropped rather than averaged away.</p>
       </div>
       <div>
         <h3>Cross-task merging</h3>

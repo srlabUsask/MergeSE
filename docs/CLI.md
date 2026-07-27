@@ -5,7 +5,7 @@ checkpoints (CodeBERT, GraphCodeBERT, UniXcoder, CodeT5-encoder, ...) into a
 single model **without any training data**, and evaluates the result on
 standard software-engineering benchmarks.
 
-It implements four task-vector-based merging algorithms:
+It implements five task-vector-based merging algorithms:
 
 - **Task-vector averaging** - simple mean of `θₖ - θ_base`.
 - **TIES** (Yadav et al., NeurIPS 2023) - trim small deltas, elect a
@@ -15,6 +15,10 @@ It implements four task-vector-based merging algorithms:
 - **WUDI** (Cheng et al., ICML 2025) - optimise each linear-layer delta to
   minimise cross-task interference; average non-linear tensors (embeddings,
   LayerNorm, biases). Data-free, but the most compute-intensive method.
+- **PCB** (Du et al., NeurIPS 2024) - score every parameter by intra-task
+  significance × cross-task competition, drop all but the top-scoring
+  fraction, and combine the survivors score-weighted. Data-free and about as
+  fast as TIES.
 
 ---
 
@@ -131,10 +135,11 @@ Verdicts:
 
 ### `mergese merge`
 
-TIES, DARE-TIES, WUDI, or average. Writes a full HuggingFace checkpoint (config
-+ weights + tokenizer) to `--output`. Reports merge time plus per-method
+TIES, DARE-TIES, WUDI, PCB, or average. Writes a full HuggingFace checkpoint
+(config + weights + tokenizer) to `--output`. Reports merge time plus per-method
 statistics (fraction trimmed and sign-conflict fraction for TIES/DARE-TIES; the
-number of WUDI-optimised linear layers for WUDI).
+number of WUDI-optimised linear layers for WUDI; the fraction of parameter
+scores that survived the drop for PCB).
 
 ```bash
 # TIES with equal weights, 20% trim
@@ -159,28 +164,51 @@ mergese merge \
     --base microsoft/codebert-base \
     --method wudi --wudi-steps 300 --wudi-lr 1e-5 --device cuda \
     --output ./merged_wudi
+
+# PCB keeping the top 10% of competition scores, ranked globally
+mergese merge m1 m2 m3 \
+    --base microsoft/codebert-base \
+    --method pcb --pcb-ratio 0.1 --pcb-lambda 1.0 --pcb-scope global \
+    --output ./merged_pcb
 ```
 
 Key options:
 
-| Flag                 | Default | Meaning                                                |
-|----------------------|---------|--------------------------------------------------------|
-| `--method`           | `ties`  | `ties` / `dare-ties` / `wudi` / `average`              |
-| `--trim-percentile`  | `20.0`  | TIES trim, in percent (`0` keeps everything)           |
-| `--drop-rate`        | `0.3`   | DARE drop fraction (only for `dare-ties`)              |
-| `--wudi-steps`       | `300`   | WUDI Adam steps per linear layer (only for `wudi`)     |
-| `--wudi-lr`          | `1e-5`  | WUDI Adam learning rate (only for `wudi`)              |
-| `--device`           | auto    | Torch device for WUDI optimisation (`cpu` / `cuda`)    |
-| `--weights`          | equal   | Comma-separated per-model λ values                     |
-| `--seed`             | `42`    | RNG seed for DARE                                      |
-| `--encoder-only`     | auto    | Force encoder-only merge (skip all heads)              |
-| `--include-heads`    | off     | Force per-tensor merge of heads even if shapes differ  |
-| `--task`             | none    | Hint used to size the merged classifier head           |
+| Flag                 | Default  | Meaning                                                |
+|----------------------|----------|--------------------------------------------------------|
+| `--method`           | `ties`   | `ties` / `dare-ties` / `wudi` / `pcb` / `average`       |
+| `--trim-percentile`  | `20.0`   | TIES trim, in percent (`0` keeps everything)           |
+| `--drop-rate`        | `0.3`    | DARE drop fraction (only for `dare-ties`)              |
+| `--wudi-steps`       | `300`    | WUDI Adam steps per linear layer (only for `wudi`)     |
+| `--wudi-lr`          | `1e-5`   | WUDI Adam learning rate (only for `wudi`)              |
+| `--pcb-ratio`        | `0.1`    | Fraction of top-scoring parameters kept (only for `pcb`) |
+| `--pcb-lambda`       | `1.0`    | Scaling λ on the merged task vector (only for `pcb`)   |
+| `--pcb-scope`        | `global` | Rank PCB scores over the whole task vector or per tensor |
+| `--device`           | auto     | Torch device for WUDI optimisation (`cpu` / `cuda`)    |
+| `--weights`          | equal    | Comma-separated per-model λ values                     |
+| `--seed`             | `42`     | RNG seed for DARE                                      |
+| `--encoder-only`     | auto     | Force encoder-only merge (skip all heads)              |
+| `--include-heads`    | off      | Force per-tensor merge of heads even if shapes differ  |
+| `--task`             | none     | Hint used to size the merged classifier head           |
 
 **WUDI note.** WUDI runs a short per-layer optimisation rather than a
 closed-form combination, so it is the slowest method - expect roughly a minute
 per merge on GPU and several minutes on CPU for a base-size encoder. Lower
 `--wudi-steps` to trade quality for speed.
+
+**PCB note.** PCB combines two per-parameter signals: *intra-balancing* (how
+much a parameter matters inside its own task vector) and *inter-balancing*
+(whether the task agrees or competes with the consensus of the others).
+Parameters that fight the consensus score negative and are dropped instead of
+being averaged away. `--pcb-ratio` controls how aggressive the drop is - `0.1`
+keeps the top 10% of `(task, parameter)` scores; raise it toward `1.0` to keep
+more. `--pcb-lambda` scales the merged task vector before it is added to the
+base; the paper tunes it per model family, so treat `1.0` as a starting point
+rather than a tuned value. `--pcb-scope global` matches the paper (one ranking
+over the flattened task vector); `--pcb-scope tensor` ranks within each
+parameter tensor, which uses less peak memory and prevents the embedding table
+from absorbing the whole keep-budget. PCB is data-free and closed-form, so it
+runs at roughly TIES' speed.
 
 **Cross-task merging.** When models have differently-shaped classifier heads
 (e.g. a 2-class clone detector + a 10-class commit classifier), MergeSE
@@ -278,7 +306,7 @@ mergese export ./merged --format onnx --output ./merged.onnx
 The merge primitives are importable:
 
 ```python
-from mergese import load_model, ties_merge, dare_ties_merge, wudi_merge, average_merge
+from mergese import load_model, ties_merge, dare_ties_merge, wudi_merge, pcb_merge, average_merge
 from mergese_tasks import get as get_task, all_tasks
 
 print([t.name for t in all_tasks()])
