@@ -173,17 +173,24 @@ class AuthStore:
         cid = "anon_" + secrets.token_hex(8)
         payload = f"{cid}.{exp}".encode()
         sig = hmac.new(self._secret, payload, hashlib.sha256).digest()
-        token = base64.urlsafe_b64encode(payload + b"." + sig).decode().rstrip("=")
+        # payload is appended to a fixed-length (32-byte) signature with no
+        # delimiter. A delimiter byte can also occur inside the raw HMAC digest,
+        # which made an earlier rsplit-based parser fail ~12% of the time.
+        token = base64.urlsafe_b64encode(payload + sig).decode().rstrip("=")
         return token, exp
 
     def _client_from_anon(self, token: str) -> Client:
         try:
             raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
-            payload, sig = raw.rsplit(b".", 1)
+            # SHA-256 HMAC is always exactly 32 bytes: slice it off the end
+            # rather than splitting on a delimiter that can appear in the digest.
+            if len(raw) < 33:  # >=1 byte of payload + 32-byte signature
+                raise AuthError(401, "malformed anonymous token")
+            payload, sig = raw[:-32], raw[-32:]
             expected = hmac.new(self._secret, payload, hashlib.sha256).digest()
             if not hmac.compare_digest(sig, expected):
                 raise AuthError(401, "invalid anonymous token")
-            cid_b, exp_b = payload.split(b".")
+            cid_b, exp_b = payload.split(b".", 1)
             cid, exp = cid_b.decode(), int(exp_b)
         except AuthError:
             raise
