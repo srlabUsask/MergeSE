@@ -25,13 +25,14 @@ Implements:
     * TIES-Merging (Yadav et al., NeurIPS 2023)
     * DARE-TIES   (Yu et al., ICML 2024 + TIES)
     * WUDI-Merging (Cheng et al., ICML 2025)
+    * PCB-Merging (Du et al., NeurIPS 2024)
     * Simple task-vector averaging
 
 Commands
 --------
     mergese tasks     List supported SE tasks and benchmarks
     mergese inspect   Analyse checkpoint compatibility
-    mergese merge     Merge checkpoints (TIES / DARE-TIES / WUDI / average)
+    mergese merge     Merge checkpoints (TIES / DARE-TIES / WUDI / PCB / average)
     mergese evaluate  Evaluate a model on any registered SE benchmark
     mergese export    Export a merged model (HF / ONNX / TorchScript)
 
@@ -196,7 +197,7 @@ def _load_state_dict(path: str) -> Dict[str, "torch.Tensor"]:  # type: ignore[na
         if bin_files:
             sd = {}
             for f in bin_files:
-                sd.update(torch.load(str(f), map_location="cpu"))
+                sd.update(torch.load(str(f), map_location="cpu", weights_only=True))
             return sd
 
         # Fall through to AutoModel.from_pretrained
@@ -643,6 +644,188 @@ def wudi_merge(
 
 
 # ---------------------------------------------------------------------------
+# PCB merging (Du et al., NeurIPS 2024)
+# ---------------------------------------------------------------------------
+
+PCB_DEFAULT_RATIO = 0.1
+PCB_DEFAULT_LAMBDA = 1.0
+PCB_SCOPES = ("global", "tensor")
+
+
+def _minmax_normalize(x: "torch.Tensor", dim: Optional[int] = None) -> "torch.Tensor":  # type: ignore[name-defined]
+    """Rescale to [0, 1] along `dim` (or over the whole tensor when dim is None)."""
+    if dim is None:
+        mn = x.min()
+        mx = x.max()
+    else:
+        mn = x.amin(dim=dim, keepdim=True)
+        mx = x.amax(dim=dim, keepdim=True)
+    return (x - mn) / (mx - mn).clamp(min=1e-12)
+
+
+def _pcb_scores(
+    deltas: Sequence["torch.Tensor"],  # type: ignore[name-defined]
+) -> "torch.Tensor":                   # type: ignore[name-defined]
+    """Parameter-competition scores for one parameter tensor.
+
+    Returns a ``[K, *shape]`` tensor holding, for every task k and every
+    parameter position i, the balancing score PCB_{k,i} = intra_{k,i} · inter_{k,i}:
+
+    * **intra-balancing** (self-awareness) - how significant position i is
+      *within* task k's own update. Squared magnitudes are min-max normalised
+      per task and pushed through ``exp(K · ·)`` so a task's dominant
+      parameters separate sharply from its background noise.
+    * **inter-balancing** (cross-task awareness) - ``tanh(τ̃_k ⊙ Σ_j τ̃_j)``
+      over RMS-normalised task vectors. This is positive where task k pulls in
+      the same direction as the consensus of all tasks and negative where it
+      fights it, so competing parameters are penalised rather than averaged
+      away. RMS normalisation makes the term invariant to per-task update
+      scale, which matters when checkpoints are fine-tuned for different
+      numbers of steps.
+    """
+    torch = _lazy_torch()
+    stack = torch.stack([d.float() for d in deltas])       # [K, *shape]
+    k = stack.shape[0]
+    flat = stack.reshape(k, -1)                            # [K, D]
+    d = flat.shape[1]
+
+    # --- intra-balancing (self-awareness) ---
+    intra = torch.exp(k * _minmax_normalize(flat.pow(2), dim=1))
+
+    # --- inter-balancing (cross-task awareness) ---
+    rms = flat.norm(dim=1, keepdim=True).clamp(min=1e-12) / math.sqrt(max(d, 1))
+    unit = flat / rms
+    inter = torch.tanh(unit * unit.sum(dim=0, keepdim=True))
+
+    return (intra * inter).reshape(stack.shape)
+
+
+def _pcb_threshold(flat_scores: "torch.Tensor", ratio: float) -> Optional[float]:  # type: ignore[name-defined]
+    """Score cutoff that keeps the top `ratio` fraction of entries.
+
+    Returns None when every entry should be kept. Uses ``torch.kthvalue``
+    rather than ``torch.quantile`` for the same reason as
+    :func:`_trim_by_percentile` - quantile caps out around 16M elements, which
+    a full task vector comfortably exceeds.
+    """
+    torch = _lazy_torch()
+    n = flat_scores.numel()
+    if n == 0 or ratio >= 1.0:
+        return None
+    keep = max(1, int(math.ceil(ratio * n)))
+    cut = n - keep
+    if cut < 1:
+        return None
+    return float(torch.kthvalue(flat_scores, cut).values.item())
+
+
+def pcb_merge(
+    base_sd: Dict[str, "torch.Tensor"],  # type: ignore[name-defined]
+    task_vectors: Sequence[Dict[str, "torch.Tensor"]],  # type: ignore[name-defined]
+    weights: Sequence[float],
+    ratio: float = PCB_DEFAULT_RATIO,
+    lam: float = PCB_DEFAULT_LAMBDA,
+    scope: str = "global",
+    progress_cb=None,
+) -> Tuple[Dict[str, "torch.Tensor"], dict]:  # type: ignore[name-defined]
+    """PCB-Merging: parameter competition balancing.
+
+    Scores every (task, parameter) pair by combining intra-task significance
+    with cross-task competition (see :func:`_pcb_scores`), drops all but the
+    top `ratio` fraction of scores, and combines the survivors as a
+    score-weighted average::
+
+        τ̂_i = Σ_k w_k · s_{k,i} · τ_{k,i} / Σ_k w_k · s_{k,i}
+        θ    = θ_base + λ · τ̂
+
+    `scope` controls where the drop threshold is computed. ``"global"``
+    ranks scores across the entire task vector at once, matching the paper's
+    formulation, which flattens the model into a single vector. ``"tensor"``
+    applies the ratio per parameter tensor; it uses less peak memory and stops
+    one large tensor (typically the embedding table) from consuming the whole
+    budget, at the cost of departing from the paper. Like the other methods
+    here, PCB needs no task data and no gradient steps.
+    """
+    torch = _lazy_torch()
+    if not 0.0 < ratio <= 1.0:
+        raise click.UsageError("--pcb-ratio must be in (0, 1].")
+    if scope not in PCB_SCOPES:
+        raise click.UsageError(f"--pcb-scope must be one of {PCB_SCOPES}.")
+
+    w_sum = float(sum(weights)) or 1.0
+    norm_w = [w / w_sum for w in weights]
+
+    keys = list(task_vectors[0].keys())
+    total = len(keys)
+
+    # ---- Pass 1: score every parameter tensor ----
+    scores: Dict[str, "torch.Tensor"] = {}  # type: ignore[name-defined]
+    for i, name in enumerate(keys):
+        reference = task_vectors[0][name]
+        deltas = [tv[name] if name in tv else torch.zeros_like(reference)
+                  for tv in task_vectors]
+        scores[name] = _pcb_scores(deltas)
+        if progress_cb is not None:
+            progress_cb(i + 1, 2 * total)
+
+    # ---- Threshold: global ranking, or per-tensor ----
+    if scope == "global":
+        flat_all = torch.cat([s.flatten() for s in scores.values()])
+        global_thr = _pcb_threshold(flat_all, ratio)
+        del flat_all
+        thresholds = {name: global_thr for name in keys}
+    else:
+        thresholds = {name: _pcb_threshold(s.flatten(), ratio)
+                      for name, s in scores.items()}
+
+    # ---- Pass 2: mask, rescale, combine ----
+    merged_delta: Dict[str, "torch.Tensor"] = {}  # type: ignore[name-defined]
+    kept = 0
+    scored = 0
+    for i, name in enumerate(keys):
+        reference = task_vectors[0][name]
+        deltas = [tv[name] if name in tv else torch.zeros_like(reference)
+                  for tv in task_vectors]
+        score = scores.pop(name)
+        thr = thresholds[name]
+        # Negative scores mark parameters that fight the cross-task consensus;
+        # they never survive the drop, and clamping keeps the weighted average
+        # below from being pulled around by a negative coefficient.
+        keep_mask = score.new_ones(score.shape) if thr is None else (score > thr)
+        weighted = score.clamp(min=0.0) * keep_mask.float()
+        kept += int(keep_mask.sum().item())
+        scored += int(score.numel())
+
+        stack = torch.stack([d.float() for d in deltas])            # [K, *shape]
+        wcol = torch.tensor(norm_w, dtype=stack.dtype).reshape(
+            -1, *([1] * (stack.ndim - 1)))
+        coeff = weighted * wcol
+        num = (coeff * stack).sum(dim=0)
+        den = coeff.sum(dim=0)
+        # Positions where every task was dropped fall back to no update, which
+        # is what leaving the base weight untouched means.
+        merged_delta[name] = torch.where(
+            den > 0, num / den.clamp(min=1e-12), torch.zeros_like(num)
+        ).to(reference.dtype)
+        if progress_cb is not None:
+            progress_cb(total + i + 1, 2 * total)
+
+    merged_sd = {k: base_sd[k] + lam * merged_delta.get(k, 0) for k in base_sd}
+    for k in merged_sd:
+        merged_sd[k] = merged_sd[k].to(base_sd[k].dtype)
+
+    stats = {
+        "method": "pcb",
+        "pcb_ratio": float(ratio),
+        "pcb_lambda": float(lam),
+        "pcb_scope": scope,
+        "kept_fraction": float(kept / scored) if scored else 0.0,
+        "weights": list(norm_w),
+    }
+    return merged_sd, stats
+
+
+# ---------------------------------------------------------------------------
 # Saving merged checkpoint
 # ---------------------------------------------------------------------------
 
@@ -891,7 +1074,7 @@ def cmd_inspect(ctx: click.Context, models: Tuple[str, ...], base: Optional[str]
 @cli.command("merge")
 @click.argument("models", nargs=-1, required=True)
 @click.option("--base", required=True, help="Path to the shared pre-trained base checkpoint.")
-@click.option("--method", type=click.Choice(["ties", "dare-ties", "wudi", "average"]),
+@click.option("--method", type=click.Choice(["ties", "dare-ties", "wudi", "pcb", "average"]),
               default="ties", show_default=True)
 @click.option("--trim-percentile", type=float, default=20.0, show_default=True,
               help="TIES trim threshold (percentile of |Δ| zeroed).")
@@ -901,6 +1084,16 @@ def cmd_inspect(ctx: click.Context, models: Tuple[str, ...], base: Optional[str]
               help="WUDI Adam steps per linear layer (only used for --method wudi).")
 @click.option("--wudi-lr", type=float, default=WUDI_DEFAULT_LR, show_default=True,
               help="WUDI Adam learning rate (only used for --method wudi).")
+@click.option("--pcb-ratio", type=float, default=PCB_DEFAULT_RATIO, show_default=True,
+              help="PCB drop ratio: fraction of highest-scoring parameters kept "
+                   "(only used for --method pcb).")
+@click.option("--pcb-lambda", type=float, default=PCB_DEFAULT_LAMBDA, show_default=True,
+              help="PCB scaling coefficient λ applied to the merged task vector "
+                   "(only used for --method pcb).")
+@click.option("--pcb-scope", type=click.Choice(list(PCB_SCOPES)), default="global",
+              show_default=True,
+              help="Where the PCB drop threshold is ranked: global (whole task "
+                   "vector, as in the paper) or per parameter tensor.")
 @click.option("--device", default=None,
               help='Torch device for WUDI optimisation ("cpu"/"cuda"); default: auto-detect.')
 @click.option("--weights", default=None,
@@ -917,6 +1110,7 @@ def cmd_inspect(ctx: click.Context, models: Tuple[str, ...], base: Optional[str]
 @click.pass_context
 def cmd_merge(ctx: click.Context, models: Tuple[str, ...], base: str, method: str,
               trim_percentile: float, drop_rate: float, wudi_steps: int, wudi_lr: float,
+              pcb_ratio: float, pcb_lambda: float, pcb_scope: str,
               device: Optional[str], weights: Optional[str],
               output: str, seed: int, encoder_only: Optional[bool], task: str) -> None:
     """Merge two or more checkpoints into a single HuggingFace model."""
@@ -1010,6 +1204,19 @@ def cmd_merge(ctx: click.Context, models: Tuple[str, ...], base: str, method: st
                 base_m.state_dict, deltas, w,
                 num_steps=wudi_steps, lr=wudi_lr, device=device,
                 progress_cb=_wudi_progress,
+            )
+    elif method == "pcb":
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                      BarColumn(), TimeElapsedColumn(), console=console, transient=True) as p:
+            ptask = p.add_task("PCB scoring", total=None)
+
+            def _pcb_progress(done: int, total: int) -> None:
+                p.update(ptask, total=total, completed=done)
+
+            merged_sd, stats = pcb_merge(
+                base_m.state_dict, deltas, w,
+                ratio=pcb_ratio, lam=pcb_lambda, scope=pcb_scope,
+                progress_cb=_pcb_progress,
             )
     elif method == "average":
         merged_sd, stats = average_merge(base_m.state_dict, deltas, w)
@@ -1171,7 +1378,11 @@ def cmd_evaluate(ctx: click.Context, model_path: str, task: str, dataset: Option
     custom_head_path = Path(resolved_model_path) / "classifier_head.bin"
     if custom_head_path.exists():
         logger.info("found classifier_head.bin - using custom-head evaluation path")
-        head_sd = torch.load(str(custom_head_path), map_location="cpu", weights_only=False)
+        # weights_only=True: this file comes from a user-supplied model dir, so
+        # it must never be trusted to unpickle arbitrary objects. The head we
+        # expect holds only tensors plus a couple of int/float scalars, all of
+        # which load fine under the safe allowlist.
+        head_sd = torch.load(str(custom_head_path), map_location="cpu", weights_only=True)
         num_labels = int(head_sd.get("num_labels", 2))
         dropout_p = float(head_sd.get("dropout", 0.1))
         encoder = transformers.AutoModel.from_pretrained(resolved_model_path)

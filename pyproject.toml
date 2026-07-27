@@ -49,6 +49,10 @@ datasets = [
 ]
 dev = [
     "pytest>=8.0",
+    # The server security/auth tests import the Flask app, so the dev extra
+    # must be able to run the full suite on its own (CI installs ".[dev]").
+    "flask>=3.0",
+    "flask-cors>=4.0",
 ]
 
 [project.scripts]

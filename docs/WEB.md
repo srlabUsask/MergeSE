@@ -130,7 +130,7 @@ sudo systemctl enable --now mergese
 |------------|------------------------------------------------------------------------------------|
 | Library    | Upload-once registry of every model and dataset visible to this server.            |
 | Inspect    | Submit 2+ models, view live compatibility verdict + pairwise table.                |
-| Merge      | Pick method / trim / drop rate / weights; download the merged zip when done.       |
+| Merge      | Pick method (TIES / DARE-TIES / WUDI / PCB / average) and its parameters; download the merged zip when done. |
 | Evaluate   | Run the merged model on a CSV benchmark; F1 / precision / recall as a table.       |
 | Export     | Repackage to HuggingFace / ONNX / TorchScript; downloadable from Jobs.             |
 | Jobs       | Persistent log of every run with downloadable artifacts and live SSE logs.         |
@@ -179,7 +179,9 @@ DELETE /api/datasets/<token>
 
 POST   /api/inspect                  { models: [str], base?: str }
 POST   /api/merge                    { models, base, method, trim_percentile,
-                                       drop_rate, weights?, seed, task?, encoder_only? }
+                                       drop_rate, wudi_steps?, wudi_lr?,
+                                       pcb_ratio?, pcb_lambda?, pcb_scope?,
+                                       weights?, seed, task?, encoder_only? }
 POST   /api/evaluate                 { model, task, dataset?, test_file?,
                                        batch_size, max_length, limit, metric? }
 POST   /api/export                   { model, format, max_length }
