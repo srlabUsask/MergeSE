@@ -70,6 +70,27 @@
       }
     },
     {
+      "name": "PCB merge (clone detection)",
+      "kind": "merge",
+      "description": "PCB-Merging across three clone detectors. Balances intra-task parameter significance against cross-task competition, keeping the top 10% of scores.",
+      "body": {
+        "models": [
+          "./checkpoints/codebert_bcb",
+          "./checkpoints/codebert_clcdsa",
+          "./checkpoints/codebert_gptclonebench"
+        ],
+        "base": "microsoft/codebert-base",
+        "method": "pcb",
+        "pcb_ratio": 0.1,
+        "pcb_lambda": 1.0,
+        "pcb_scope": "global",
+        "weights": "1,1,1",
+        "seed": 42,
+        "task": "clone_detection",
+        "encoder_only": false
+      }
+    },
+    {
       "name": "Cross-task merge: clone + vuln + defect",
       "kind": "merge",
       "description": "Encoder-only merge across three different SE tasks \u2014 classifier heads have different shapes so only the encoder is merged; downstream re-attach a fresh head.",

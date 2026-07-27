@@ -622,6 +622,9 @@ function applyPreset(kind) {
     applyMethodDefaults($("#mMethod").value, { overwrite: false });
     $("#mTrim").value   = b.trim_percentile ?? 20;
     $("#mDrop").value   = b.drop_rate ?? 0.3;
+    if ($("#mPcbRatio"))  $("#mPcbRatio").value  = b.pcb_ratio ?? 0.1;
+    if ($("#mPcbLambda")) $("#mPcbLambda").value = b.pcb_lambda ?? 1;
+    if ($("#mPcbScope"))  $("#mPcbScope").value  = b.pcb_scope || "global";
     $("#mWeights").value= b.weights || "";
     $("#mSeed").value   = b.seed ?? 42;
     if ($("#mTask"))  $("#mTask").value  = b.task || "";
@@ -683,41 +686,57 @@ async function submit(path, body, opts) {
  *   ties:      trim 20%
  *   dare-ties: trim 20%, drop 0.3
  *   wudi:      300 Adam steps per linear layer, lr 1e-5
+ *   pcb:       keep the top 10% of competition scores, λ 1.0, global ranking
  *   average:   no trim/drop
  */
 const METHOD_DEFAULTS = {
   "ties":      { trim: 20, drop: 0.0, trimEnabled: true,  dropEnabled: false,
-                 wudiEnabled: false,
+                 wudiEnabled: false, pcbEnabled: false,
                  trimHint: "TIES default: 20 - drops the smallest 20% of |Δ|",
                  dropHint: "not used by TIES (only DARE-TIES)",
-                 wudiHint: "not used by TIES (only WUDI)" },
+                 wudiHint: "not used by TIES (only WUDI)",
+                 pcbHint:  "not used by TIES (only PCB)" },
   "dare-ties": { trim: 20, drop: 0.3, trimEnabled: true,  dropEnabled: true,
-                 wudiEnabled: false,
+                 wudiEnabled: false, pcbEnabled: false,
                  trimHint: "DARE-TIES default: 20",
                  dropHint: "DARE-TIES default: 0.3 - drop 30% of task-vector entries before TIES",
-                 wudiHint: "not used by DARE-TIES (only WUDI)" },
+                 wudiHint: "not used by DARE-TIES (only WUDI)",
+                 pcbHint:  "not used by DARE-TIES (only PCB)" },
   "wudi":      { trim: 0,  drop: 0.0, trimEnabled: false, dropEnabled: false,
-                 wudiEnabled: true,
+                 wudiEnabled: true,  pcbEnabled: false,
                  trimHint: "ignored - WUDI does not trim",
                  dropHint: "ignored - WUDI does not use DARE",
-                 wudiHint: "WUDI defaults: 300 steps, lr 1e-5 per linear layer" },
+                 wudiHint: "WUDI defaults: 300 steps, lr 1e-5 per linear layer",
+                 pcbHint:  "not used by WUDI (only PCB)" },
+  "pcb":       { trim: 0,  drop: 0.0, trimEnabled: false, dropEnabled: false,
+                 wudiEnabled: false, pcbEnabled: true,
+                 pcbRatio: 0.1, pcbLambda: 1.0, pcbScope: "global",
+                 trimHint: "ignored - PCB drops by competition score, not by |Δ|",
+                 dropHint: "ignored - PCB does not use DARE",
+                 wudiHint: "not used by PCB (only WUDI)",
+                 pcbHint:  "PCB defaults: keep top 10% of scores, λ 1.0, ranked globally" },
   "average":   { trim: 0,  drop: 0.0, trimEnabled: false, dropEnabled: false,
-                 wudiEnabled: false,
+                 wudiEnabled: false, pcbEnabled: false,
                  trimHint: "ignored - averaging keeps all entries",
                  dropHint: "ignored - averaging doesn't use DARE",
-                 wudiHint: "not used by averaging (only WUDI)" },
+                 wudiHint: "not used by averaging (only WUDI)",
+                 pcbHint:  "not used by averaging (only PCB)" },
 };
 
 function applyMethodDefaults(method, opts = {}) {
   const d = METHOD_DEFAULTS[method] || METHOD_DEFAULTS.ties;
   const trim = $("#mTrim"), drop = $("#mDrop");
   const wudiSteps = $("#mWudiSteps"), wudiLr = $("#mWudiLr");
+  const pcbRatio = $("#mPcbRatio"), pcbLambda = $("#mPcbLambda"), pcbScope = $("#mPcbScope");
   // overwrite=true on method-change events; overwrite=false on initial render
   // (we still want the field disabled state to reflect the method, but we
   // don't want to clobber a value the user just typed).
   if (opts.overwrite !== false) {
     trim.value = d.trim;
     drop.value = d.drop;
+    if (pcbRatio && d.pcbRatio  !== undefined) pcbRatio.value  = d.pcbRatio;
+    if (pcbLambda && d.pcbLambda !== undefined) pcbLambda.value = d.pcbLambda;
+    if (pcbScope && d.pcbScope  !== undefined) pcbScope.value  = d.pcbScope;
   }
   trim.disabled = !d.trimEnabled;
   drop.disabled = !d.dropEnabled;
@@ -728,6 +747,12 @@ function applyMethodDefaults(method, opts = {}) {
     wudiLr.disabled = !d.wudiEnabled;
     $("#mWudiStepsHint").textContent = d.wudiHint;
     $("#mWudiLrHint").textContent = d.wudiHint;
+  }
+  if (pcbRatio && pcbLambda && pcbScope) {
+    pcbRatio.disabled = pcbLambda.disabled = pcbScope.disabled = !d.pcbEnabled;
+    $("#mPcbRatioHint").textContent  = d.pcbHint;
+    $("#mPcbLambdaHint").textContent = d.pcbHint;
+    $("#mPcbScopeHint").textContent  = d.pcbHint;
   }
 }
 
@@ -757,6 +782,9 @@ function bindForms() {
       drop_rate: parseFloat($("#mDrop").value),
       wudi_steps: parseInt($("#mWudiSteps").value, 10),
       wudi_lr: parseFloat($("#mWudiLr").value),
+      pcb_ratio: parseFloat($("#mPcbRatio").value),
+      pcb_lambda: parseFloat($("#mPcbLambda").value),
+      pcb_scope: $("#mPcbScope").value,
       weights: $("#mWeights").value.trim() || null,
       seed: parseInt($("#mSeed").value, 10),
       task: $("#mTask") ? ($("#mTask").value || null) : null,
