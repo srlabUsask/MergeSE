@@ -72,8 +72,14 @@ Set `MERGESE_REQUIRE_AUTH=1` to require an identity on every mutating request
 
 | Caller | Credential | How obtained |
 |--------|-----------|--------------|
-| Website user | short-lived **anonymous token** | `POST /api/v1/anon-token` after a Turnstile challenge |
-| CLI / programmatic | long-lived **API key** | minted by an admin |
+| Website user | short-lived **anonymous token** | the web UI renders a Turnstile challenge and calls `POST /api/v1/anon-token` automatically |
+| CLI / programmatic | long-lived **API key** | minted by an admin (also usable in the web UI's "Have an API key?" box) |
+
+With auth on, the front-end gates the whole app behind the challenge, attaches
+the resulting token to every request (`Authorization: Bearer`, or `?token=` for
+the SSE log stream), and each visitor sees only their own jobs. The public
+`/api/v1/config` endpoint tells the front-end whether auth is on and supplies
+the Turnstile site key.
 
 Keys are stored only as SHA-256 hashes; the plaintext is shown once. Tiers cap a
 daily job budget and simultaneous active jobs (`anonymous` / `key` / `approved`,
@@ -87,7 +93,8 @@ read, cancel, or download another's job (cross-tenant requests return 404, not
 |---------|---------|
 | `MERGESE_REQUIRE_AUTH` | `1` to require auth (default `0`) |
 | `MERGESE_ADMIN_TOKEN` | bearer token that guards key minting (`/api/v1/keys`) |
-| `MERGESE_TURNSTILE_SECRET` | Cloudflare Turnstile secret; when set, anon tokens require a passing challenge |
+| `MERGESE_TURNSTILE_SECRET` | Cloudflare Turnstile **secret** key; when set, anon tokens require a passing challenge |
+| `MERGESE_TURNSTILE_SITE_KEY` | Cloudflare Turnstile **site** key (public); the front-end fetches it via `/api/v1/config` to render the widget |
 | `MERGESE_DISABLE_ANON` | **emergency switch**: refuse anonymous tokens, require API keys, no redeploy |
 | `MERGESE_AUTH_DB` | sqlite path for the key/quota store |
 | `MERGESE_AUTH_SECRET` | signing secret for anon tokens (persisted if unset) |

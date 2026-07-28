@@ -21,11 +21,122 @@ function toast(msg, kind = "") {
   toast._t = setTimeout(() => { t.hidden = true; }, 3800);
 }
 
+/* ---------------------- Auth ----------------------
+ * When the server has auth enabled (/api/v1/config -> require_auth), the app is
+ * gated behind a Cloudflare Turnstile challenge (or an API key). Passing it
+ * yields a token that is attached to every request, giving each visitor a
+ * private, isolated workspace. When auth is disabled the whole layer is inert.
+ */
+const AUTH = { required: false, siteKey: "", turnstileRequired: false,
+               token: null, widgetId: null, booted: false };
+const TOKEN_KEY = "mergese_token";
+
+function authHeaders() {
+  return AUTH.token ? { "Authorization": "Bearer " + AUTH.token } : {};
+}
+function storeToken(token, exp) {
+  AUTH.token = token;
+  try { localStorage.setItem(TOKEN_KEY, JSON.stringify({ token, exp: exp || 0 })); } catch (_) {}
+}
+function clearToken() {
+  AUTH.token = null;
+  try { localStorage.removeItem(TOKEN_KEY); } catch (_) {}
+}
+function loadStoredToken() {
+  try {
+    const o = JSON.parse(localStorage.getItem(TOKEN_KEY) || "null");
+    if (!o || !o.token) return null;
+    if (o.exp && o.exp * 1000 < Date.now() + 5000) { clearToken(); return null; }
+    return o.token;
+  } catch (_) { return null; }
+}
+
+async function loadAuthConfig() {
+  try {
+    const c = await fetch(API + "/api/v1/config").then(r => r.json());
+    AUTH.required = !!c.require_auth;
+    AUTH.siteKey = c.turnstile_site_key || "";
+    AUTH.turnstileRequired = !!c.turnstile_required;
+  } catch (_) { AUTH.required = false; }
+}
+
+function showGate(msg) {
+  const g = $("#authGate");
+  if (!g) return;
+  g.hidden = false;
+  $("#authGateMsg").textContent = msg || "";
+  renderTurnstile();
+}
+function hideGate() { const g = $("#authGate"); if (g) g.hidden = true; }
+
+function renderTurnstile() {
+  // No Turnstile configured (dev / trusted network): grab a token directly.
+  if (!AUTH.turnstileRequired || !AUTH.siteKey) { exchangeAnon(null); return; }
+  const doRender = () => {
+    if (!window.turnstile) { setTimeout(doRender, 250); return; }
+    if (AUTH.widgetId !== null) { try { window.turnstile.reset(AUTH.widgetId); } catch (_) {} return; }
+    AUTH.widgetId = window.turnstile.render("#turnstileBox", {
+      sitekey: AUTH.siteKey,
+      callback: (tok) => exchangeAnon(tok),
+      "error-callback": () => { $("#authGateMsg").textContent = "Challenge failed - try again."; },
+      "expired-callback": () => { try { window.turnstile.reset(AUTH.widgetId); } catch (_) {} },
+    });
+  };
+  doRender();
+}
+
+async function exchangeAnon(cfToken) {
+  try {
+    const r = await fetch(API + "/api/v1/anon-token", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: cfToken ? JSON.stringify({ cf_turnstile_response: cfToken }) : "{}",
+    });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || r.statusText); }
+    const d = await r.json();
+    storeToken(d.token, d.expires_at);
+    hideGate();
+    bootApp();
+  } catch (e) {
+    $("#authGateMsg").textContent = "Could not verify: " + e.message;
+    if (AUTH.widgetId !== null && window.turnstile) { try { window.turnstile.reset(AUTH.widgetId); } catch (_) {} }
+  }
+}
+
+async function useApiKey() {
+  const key = ($("#apiKeyInput").value || "").trim();
+  if (!key) return;
+  try {
+    const r = await fetch(API + "/api/v1/limits", { headers: { "Authorization": "Bearer " + key } });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || "invalid key"); }
+    storeToken(key, 0);              // API keys don't carry a client-side expiry
+    hideGate();
+    bootApp();
+  } catch (e) {
+    $("#authGateMsg").textContent = "Key rejected: " + e.message;
+  }
+}
+
+// Returns true if the app may boot immediately; false means the gate is up and
+// will boot the app once the visitor authenticates.
+async function ensureAuth() {
+  if (!AUTH.required) return true;
+  const stored = loadStoredToken();
+  if (stored) { AUTH.token = stored; return true; }
+  showGate();
+  return false;
+}
+
 async function api(path, opts = {}) {
+  const { headers: extra, ...rest } = opts;
   const res = await fetch(API + path, {
-    headers: { "content-type": "application/json" },
-    ...opts,
+    headers: { "content-type": "application/json", ...authHeaders(), ...(extra || {}) },
+    ...rest,
   });
+  if (res.status === 401 && AUTH.required) {
+    clearToken();
+    showGate("Your session expired - please verify again.");
+    throw new Error("session expired");
+  }
   if (!res.ok) {
     let msg = res.statusText;
     try { const j = await res.json(); msg = j.error || msg; } catch (_) {}
@@ -978,7 +1089,7 @@ async function selectJob(id) {
     streamJob(job, log);
   } else {
     try {
-      const txt = await fetch(API + `/api/jobs/${job.id}/log`).then(r => r.text());
+      const txt = await fetch(API + `/api/jobs/${job.id}/log`, { headers: authHeaders() }).then(r => r.text());
       log.textContent = txt || "(no output)";
       log.scrollTop = log.scrollHeight;
     } catch (e) { log.textContent = `failed to load log: ${e.message}`; }
@@ -992,7 +1103,9 @@ async function selectJob(id) {
 }
 
 function streamJob(job, logEl) {
-  const url = API + `/api/jobs/${job.id}/stream`;
+  let url = API + `/api/jobs/${job.id}/stream`;
+  // EventSource can't set headers, so the token rides as a query param.
+  if (AUTH.token) url += (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(AUTH.token);
   const es = new EventSource(url);
   CURRENT_SSE = es;
   es.onmessage = (ev) => {
@@ -1059,16 +1172,35 @@ function escape(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<"
 
 /* ---------------------- Init ---------------------- */
 
-document.addEventListener("DOMContentLoaded", async () => {
+// The API-touching part of startup. Runs once, after auth is resolved.
+async function bootApp() {
+  if (AUTH.booted) return;
+  AUTH.booted = true;
   await Promise.all([loadTasks(), loadLibrary()]);
-  initModelLists();
-  bindForms();
-  bindLibraryUpload();
-  bindLibrarySearch();
-  await Promise.all([checkHealth(), loadPresets()]);
+  await loadPresets();
   refreshJobs();
   // refresh jobs every 3s; refresh library every 15s (cheaper, picks up finished
   // jobs so the "From finished jobs" group stays current)
   setInterval(() => refreshJobs(false), 3000);
   setInterval(() => loadLibrary(),    15000);
+}
+
+function bindAuthUI() {
+  const b = $("#apiKeyBtn"); if (b) b.addEventListener("click", useApiKey);
+  const i = $("#apiKeyInput");
+  if (i) i.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); useApiKey(); } });
+}
+
+document.addEventListener("DOMContentLoaded", async () => {
+  await loadAuthConfig();
+  // UI wiring that doesn't hit authed endpoints can run immediately.
+  initModelLists();
+  bindForms();
+  bindLibraryUpload();
+  bindLibrarySearch();
+  bindAuthUI();
+  checkHealth();                 // /api/health is public
+  // Boot now if auth is off or we already hold a valid token; otherwise the
+  // gate handles it and calls bootApp() after a successful challenge.
+  if (await ensureAuth()) bootApp();
 });

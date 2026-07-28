@@ -176,6 +176,9 @@ REQUIRE_AUTH = bool(int(os.environ.get("MERGESE_REQUIRE_AUTH", "0")))
 DISABLE_ANON = bool(int(os.environ.get("MERGESE_DISABLE_ANON", "0")))
 ADMIN_TOKEN = os.environ.get("MERGESE_ADMIN_TOKEN", "")
 TURNSTILE_SECRET = os.environ.get("MERGESE_TURNSTILE_SECRET", "")
+# Public Turnstile site key - safe to expose to the browser. The front-end
+# fetches it from /api/v1/config to render the challenge widget.
+TURNSTILE_SITE_KEY = os.environ.get("MERGESE_TURNSTILE_SITE_KEY", "")
 AUTH_DB = Path(os.environ.get("MERGESE_AUTH_DB", str(ARTIFACTS_ROOT / "_auth" / "auth.db")))
 ANON_TTL_SEC = int(os.environ.get("MERGESE_ANON_TTL_SEC", "3600"))
 
@@ -277,6 +280,24 @@ def _bearer_token() -> Optional[str]:
     return None
 
 
+def _request_token() -> Optional[str]:
+    """Caller token from the Bearer header, X-Anon-Token header, or ?token= query.
+
+    The query-param form exists for EventSource (SSE), which cannot set custom
+    request headers - the job-log stream passes its token that way.
+    """
+    t = _bearer_token()
+    if t:
+        return t
+    x = request.headers.get("X-Anon-Token")
+    if x:
+        return x.strip()
+    q = request.args.get("token")
+    if q:
+        return q.strip()
+    return None
+
+
 def _resolve_client():
     """Resolve the calling identity for this request.
 
@@ -287,16 +308,15 @@ def _resolve_client():
     if not REQUIRE_AUTH:
         return None
     import auth as _authmod
-    token = _bearer_token()
-    api_key = token if (token and token.startswith(_authmod.KEY_PREFIX)) else None
-    anon = request.headers.get("X-Anon-Token") or (token if not api_key else None)
+    token = _request_token()
+    if not token:
+        raise _authmod.AuthError(401, "authentication required")
+    api_key = token if token.startswith(_authmod.KEY_PREFIX) else None
+    anon = None if api_key else token
     if anon and DISABLE_ANON:
-        # Emergency mode: only API keys are accepted.
-        if not api_key:
-            raise _authmod.AuthError(
-                403, "anonymous access is temporarily disabled; use an API key")
-    client = _auth_store().authenticate(api_key, None if DISABLE_ANON else anon)
-    return client
+        raise _authmod.AuthError(
+            403, "anonymous access is temporarily disabled; use an API key")
+    return _auth_store().authenticate(api_key, None if DISABLE_ANON else anon)
 
 
 def _client_active_jobs(client_id: str) -> int:
@@ -1800,6 +1820,17 @@ _start_janitor()
 
 
 # ---- auth endpoints (/api/v1) ------------------------------------------------
+
+@app.route("/api/v1/config", methods=["GET"])
+def api_public_config():
+    """Public, unauthenticated: tells the front-end whether/how to authenticate."""
+    return jsonify({
+        "require_auth": REQUIRE_AUTH,
+        "turnstile_site_key": TURNSTILE_SITE_KEY,
+        "turnstile_required": bool(TURNSTILE_SECRET),
+        "anon_enabled": REQUIRE_AUTH and not DISABLE_ANON,
+    })
+
 
 @app.route("/api/v1/anon-token", methods=["POST"])
 def api_anon_token():
