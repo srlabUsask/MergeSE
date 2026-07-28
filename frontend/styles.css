@@ -559,6 +559,9 @@ footer {
   background: rgba(8, 10, 20, 0.82);
   backdrop-filter: blur(4px);
 }
+/* The `hidden` attribute must win over the display above, or the overlay never
+   goes away after the challenge is passed. */
+.auth-gate[hidden] { display: none; }
 .auth-card {
   width: 100%;
   max-width: 420px;
