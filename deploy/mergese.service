@@ -28,6 +28,7 @@ Environment="HF_HOME=/opt/mergese/.cache/huggingface"
 # Environment="MERGESE_REQUIRE_AUTH=1"
 # Environment="MERGESE_ADMIN_TOKEN=change-me-to-a-long-random-secret"
 # Environment="MERGESE_TURNSTILE_SECRET=your-cloudflare-turnstile-secret"
+# Environment="MERGESE_TURNSTILE_SITE_KEY=your-cloudflare-turnstile-site-key"
 # Worker sandbox is offline + rlimited by default; safetensors-only uploads by default.
 
 # Use the local venv if present, otherwise system python

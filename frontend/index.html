@@ -7,8 +7,30 @@
 <meta name="description" content="Post-hoc model merging for software-engineering models. TIES, DARE-TIES, and task-vector averaging on fine-tuned HuggingFace checkpoints." />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="stylesheet" href="styles.css" />
+<!-- Cloudflare Turnstile (bot challenge). Only renders when the server has
+     auth enabled; harmless to load otherwise. -->
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
 <body>
+
+<!-- Auth gate: shown only when the server requires authentication. Blocks the
+     app until the visitor passes the bot challenge (or supplies an API key). -->
+<div id="authGate" class="auth-gate" hidden>
+  <div class="auth-card">
+    <div class="auth-title">Verify you're human</div>
+    <p class="auth-sub">Complete the quick check to use MergeSE. This keeps the
+       free service available to everyone and gives you a private workspace.</p>
+    <div id="turnstileBox"></div>
+    <div id="authGateMsg" class="auth-msg"></div>
+    <details class="auth-key">
+      <summary>Have an API key?</summary>
+      <div class="auth-key-row">
+        <input id="apiKeyInput" type="password" placeholder="mse_live_..." autocomplete="off" />
+        <button id="apiKeyBtn" type="button" class="btn btn-primary btn-sm">Use key</button>
+      </div>
+    </details>
+  </div>
+</div>
 
 <header class="topbar">
   <div class="brand">

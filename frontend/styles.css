@@ -546,3 +546,37 @@ footer {
   .topbar nav a:not(.gh-link) { display: none; }
   .grid { grid-template-columns: 1fr; }
 }
+
+/* ---------------------- Auth gate ---------------------- */
+.auth-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(8, 10, 20, 0.82);
+  backdrop-filter: blur(4px);
+}
+.auth-card {
+  width: 100%;
+  max-width: 420px;
+  background: #12151f;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 28px 26px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  text-align: center;
+}
+.auth-title { font-size: 1.25rem; font-weight: 700; margin-bottom: 8px; }
+.auth-sub { color: #9aa4b2; font-size: 0.9rem; line-height: 1.5; margin-bottom: 18px; }
+#turnstileBox { display: flex; justify-content: center; min-height: 65px; }
+.auth-msg { color: #f0a; font-size: 0.85rem; min-height: 1.2em; margin-top: 10px; }
+.auth-key { margin-top: 18px; text-align: left; }
+.auth-key summary { cursor: pointer; color: #9aa4b2; font-size: 0.85rem; }
+.auth-key-row { display: flex; gap: 8px; margin-top: 10px; }
+.auth-key-row input {
+  flex: 1; padding: 8px 10px; border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12); background: #0c0e16; color: #e6e9ef;
+}
