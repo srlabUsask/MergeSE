@@ -99,6 +99,9 @@ read, cancel, or download another's job (cross-tenant requests return 404, not
 | `MERGESE_AUTH_DB` | sqlite path for the key/quota store |
 | `MERGESE_AUTH_SECRET` | signing secret for anon tokens (persisted if unset) |
 | `MERGESE_ANON_TTL_SEC` | anon-token lifetime (default 3600) |
+| `MERGESE_ANON_DAILY_JOBS` / `MERGESE_ANON_MAX_ACTIVE` | anonymous tier quota (defaults 30 / 2) |
+| `MERGESE_KEY_DAILY_JOBS` / `MERGESE_KEY_MAX_ACTIVE` | API-key tier quota (defaults 100 / 3) |
+| `MERGESE_APPROVED_DAILY_JOBS` / `MERGESE_APPROVED_MAX_ACTIVE` | approved tier quota (defaults 1000 / 5) |
 
 ### Minting keys
 

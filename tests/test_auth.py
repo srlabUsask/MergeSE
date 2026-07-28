@@ -111,9 +111,10 @@ def test_daily_job_limit_enforced(store):
 def test_active_job_limit_enforced(store):
     _, key = store.mint_key()
     client = store.authenticate(api_key=key, anon_token=None)
-    # anonymous/key tiers allow max_active=1; simulate one already running.
+    # Simulate the caller already at their tier's active-job cap.
+    cap = client.tier.max_active
     with pytest.raises(auth.AuthError) as ei:
-        store.check_and_reserve(client, active_jobs=1)
+        store.check_and_reserve(client, active_jobs=cap)
     assert ei.value.status == 429
     assert "active" in ei.value.message.lower()
 

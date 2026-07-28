@@ -43,10 +43,26 @@ class Tier:
     max_active: int
 
 
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# Per-tier caps. Defaults comfortably fit several full inspect -> merge ->
+# evaluate -> export workflows a day; every value is overridable by env so an
+# operator can tune quotas without a code change.
 TIERS: Dict[str, Tier] = {
-    "anonymous": Tier("anonymous", daily_jobs=2, max_active=1),
-    "key": Tier("key", daily_jobs=10, max_active=1),
-    "approved": Tier("approved", daily_jobs=200, max_active=3),
+    "anonymous": Tier("anonymous",
+                      daily_jobs=_int_env("MERGESE_ANON_DAILY_JOBS", 30),
+                      max_active=_int_env("MERGESE_ANON_MAX_ACTIVE", 2)),
+    "key": Tier("key",
+                daily_jobs=_int_env("MERGESE_KEY_DAILY_JOBS", 100),
+                max_active=_int_env("MERGESE_KEY_MAX_ACTIVE", 3)),
+    "approved": Tier("approved",
+                     daily_jobs=_int_env("MERGESE_APPROVED_DAILY_JOBS", 1000),
+                     max_active=_int_env("MERGESE_APPROVED_MAX_ACTIVE", 5)),
 }
 
 KEY_PREFIX = "mse_live_"
