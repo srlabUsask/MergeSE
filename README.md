@@ -285,23 +285,40 @@ one to claim it before you start.
 If you use MergeSE itself, please cite the tool paper:
 
 ```bibtex
-@inproceedings{roy2026mergese,
-  author    = {Palash R. Roy and Banani Roy and Chanchal K. Roy and Kevin A. Schneider},
-  title     = {MergeSE: Post-hoc Model Merging for Software Engineering Tasks Without Retraining},
-  booktitle = {Proc. ASE Tool Track (under review)},
-  year      = {2026}
+@inproceedings{Roy2026MergeSE,
+  author    = {Roy, Palash R. and Roy, Banani and Schneider, Kevin A. and Roy, Chanchal K.},
+  title     = {{MergeSE}: Post-Hoc Model Merging for Software Engineering Tasks without Retraining},
+  booktitle = {Proceedings of the 41st IEEE/ACM International Conference on Automated Software Engineering},
+  series    = {ASE '26},
+  year      = {2026},
+  month     = oct,
+  location  = {Munich, Germany},
+  publisher = {Association for Computing Machinery},
+  address   = {New York, NY, USA},
+  isbn      = {979-8-4007-2882-2},
+  numpages  = {5},
+  doi       = {10.1145/3832783.3834630},
+  url       = {https://doi.org/10.1145/3832783.3834630}
 }
 ```
 
-If you use the merging methodology MergeSE packages, please also cite our
+If you use the merging methodology in the MergeSE packages, please also cite our
 research-track paper:
 
 ```bibtex
-@inproceedings{roy2026unified,
-  author    = {Palash R. Roy and Banani Roy and Chanchal K. Roy and Kevin A. Schneider},
+@inproceedings{Roy2026Unified,
+  author    = {Roy, Palash R. and Roy, Banani and Schneider, Kevin A. and Roy, Chanchal K.},
   title     = {A Unified Model for Cross-Domain Clone Detection via Model Merging},
-  booktitle = {Proc. ASE (Under Review)},
-  year      = {2026}
+  booktitle = {Proceedings of the 41st IEEE/ACM International Conference on Automated Software Engineering},
+  series    = {ASE '26},
+  year      = {2026},
+  month     = oct,
+  location  = {Munich, Germany},
+  publisher = {Association for Computing Machinery},
+  address   = {New York, NY, USA},
+  numpages  = {13},
+  doi       = {10.1145/3832783.3837415},
+  url       = {https://doi.org/10.1145/3832783.3837415}
 }
 ```
 
