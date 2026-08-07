@@ -5,6 +5,14 @@ title: "MergeSE: Post-hoc Model Merging for Software Engineering Tasks Without R
 version: 0.2.0
 license: Apache-2.0
 repository-code: "https://github.com/srlabUsask/MergeSE"
+doi: 10.5281/zenodo.21797312
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.21797312
+    description: "Concept DOI (resolves to the latest version)"
+  - type: doi
+    value: 10.5281/zenodo.21797313
+    description: "DOI for v0.2.0"
 authors:
   - family-names: Roy
     given-names: "Palash R."
