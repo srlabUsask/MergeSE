@@ -1,6 +1,8 @@
 # MergeSE - Post-hoc Model Merging for Software Engineering
 
 [![CI](https://github.com/srlabUsask/MergeSE/actions/workflows/ci.yml/badge.svg)](https://github.com/srlabUsask/MergeSE/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 
 > Tool artifact for the ASE 2026 Tool-Track submission
 > **"MergeSE: Post-hoc Model Merging for Software Engineering Tasks Without Retraining"**
@@ -267,6 +269,14 @@ short-lived **anonymous tokens** (Turnstile-gated), with daily/active-job quotas
 and per-job ownership. Mint keys with `python server/manage_keys.py mint`. TLS,
 HTTP rate limiting, and security headers are configured at the nginx/ingress
 layer — see the deployment doc.
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and PR guidance.
+Issues labelled `good first issue` are self-contained; comment on
+one to claim it before you start.
 
 ---
 

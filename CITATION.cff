@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+message: "If you use MergeSE, please cite the tool paper below."
+type: software
+title: "MergeSE: Post-hoc Model Merging for Software Engineering Tasks Without Retraining"
+version: 0.2.0
+license: Apache-2.0
+repository-code: "https://github.com/srlabUsask/MergeSE"
+authors:
+  - family-names: Roy
+    given-names: "Palash R."
+    affiliation: "University of Saskatchewan"
+    email: palash.roy@usask.ca
+  - family-names: Roy
+    given-names: "Banani"
+    affiliation: "University of Saskatchewan"
+  - family-names: Roy
+    given-names: "Chanchal K."
+    affiliation: "University of Saskatchewan"
+  - family-names: Schneider
+    given-names: "Kevin A."
+    affiliation: "University of Saskatchewan"
+preferred-citation:
+  type: conference-paper
+  title: "MergeSE: Post-hoc Model Merging for Software Engineering Tasks Without Retraining"
+  year: 2026
+  collection-title: "Proceedings of the 41st IEEE/ACM International Conference on Automated Software Engineering (ASE) - Tool Track"
+  authors:
+    - family-names: Roy
+      given-names: "Palash R."
+    - family-names: Roy
+      given-names: "Banani"
+    - family-names: Roy
+      given-names: "Chanchal K."
+    - family-names: Schneider
+      given-names: "Kevin A."
