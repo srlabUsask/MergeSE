@@ -94,6 +94,58 @@ def test_ties_merge_resolves_conflicts():
     assert stats["method"] == "ties"
 
 
+def test_elect_sign_handles_ragged_deltas():
+    """Regression: when `_compute_task_vector` filters a shape-mismatched
+    tensor out of one model's delta (e.g. CodeBERT 50265-vocab base vs
+    UniXcoder 51416-vocab), the resulting deltas have different keysets.
+    The sign-election pass must walk the UNION of keys, not deltas[0].keys(),
+    and treat missing entries as a zero vote - without this fix the TIES/
+    DARE-TIES/average mergers KeyError'd on prod with these three HF
+    checkpoints as inputs."""
+    # Both models have 'shared'; only model 1 has 'only_in_1'; only model 2 has 'only_in_2'.
+    d1 = {"shared": torch.tensor([+1.0, -1.0]), "only_in_1": torch.tensor([+1.0])}
+    d2 = {"shared": torch.tensor([+1.0, +1.0]), "only_in_2": torch.tensor([-1.0])}
+    elected = _elect_sign([d1, d2], [1.0, 1.0])
+    assert set(elected.keys()) == {"shared", "only_in_1", "only_in_2"}
+    # The exclusive keys come straight from the one model that had them.
+    assert elected["only_in_1"].item() == 1.0
+    assert elected["only_in_2"].item() == -1.0
+
+
+def test_ties_merge_survives_ragged_deltas():
+    """End-to-end: TIES on three deltas with mismatched keysets must produce
+    a merged state dict and not crash on `d[name]` for a key one model lacks."""
+    base = {
+        "shared": torch.zeros(4),
+        "only_in_1": torch.zeros(2),
+        "only_in_2": torch.zeros(2),
+    }
+    d1 = {"shared": torch.tensor([1.0, 1.0, -1.0, 0.0]),
+          "only_in_1": torch.tensor([0.5, 0.5])}
+    d2 = {"shared": torch.tensor([1.0, -1.0, -1.0, 0.5]),
+          "only_in_2": torch.tensor([0.5, 0.5])}
+    d3 = {"shared": torch.tensor([1.0, 1.0, -1.0, 0.0])}  # third model missing both exclusives
+    merged, stats = ties_merge(base, [d1, d2, d3], [1.0, 1.0, 1.0], 0.0)
+    # Base keys all present in output; exclusives got only their one model's contribution.
+    assert set(merged.keys()) == set(base.keys())
+    assert merged["only_in_1"][0].item() > 0  # d1 contributed
+    assert merged["only_in_2"][0].item() > 0  # d2 contributed
+    assert stats["method"] == "ties"
+
+
+def test_average_merge_survives_ragged_deltas():
+    base = {"a": torch.zeros(2), "b": torch.zeros(2)}
+    # Only the first model has 'b'; averaging must not KeyError on d['b'] for d2.
+    deltas = [
+        {"a": torch.tensor([2.0, 2.0]), "b": torch.tensor([4.0, 4.0])},
+        {"a": torch.tensor([4.0, 4.0])},  # no 'b'
+    ]
+    merged, _ = average_merge(base, deltas, [1.0, 1.0])
+    assert torch.allclose(merged["a"], torch.tensor([3.0, 3.0]))
+    # 'b' takes the one model's half-weighted delta (only d1 contributed, with norm_w=0.5).
+    assert torch.allclose(merged["b"], torch.tensor([2.0, 2.0]))
+
+
 def test_dare_ties_runs_and_is_deterministic():
     base = {"w": torch.zeros(64)}
     g = torch.Generator().manual_seed(0)
