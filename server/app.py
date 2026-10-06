@@ -180,7 +180,10 @@ TURNSTILE_SECRET = os.environ.get("MERGESE_TURNSTILE_SECRET", "")
 # fetches it from /api/v1/config to render the challenge widget.
 TURNSTILE_SITE_KEY = os.environ.get("MERGESE_TURNSTILE_SITE_KEY", "")
 AUTH_DB = Path(os.environ.get("MERGESE_AUTH_DB", str(ARTIFACTS_ROOT / "_auth" / "auth.db")))
-ANON_TTL_SEC = int(os.environ.get("MERGESE_ANON_TTL_SEC", "3600"))
+# 24 hours by default so a visitor who uploads a model and comes back after
+# lunch doesn't lose access to their own uploads. Still bounded for a shared
+# anonymous identity namespace. Operators tune with MERGESE_ANON_TTL_SEC.
+ANON_TTL_SEC = int(os.environ.get("MERGESE_ANON_TTL_SEC", "86400"))
 
 _AUTH = None  # lazily created AuthStore
 
@@ -325,17 +328,38 @@ def _client_active_jobs(client_id: str) -> int:
                    if j.owner == client_id and j.status in ("pending", "running"))
 
 
-def _authorize_job_submission():
-    """Authenticate + enforce per-caller quotas for a job-creating request.
+def _authenticate() -> Optional[str]:
+    """Authenticate the request and return the caller's client id.
 
-    Returns the owner id to stamp on the job (None when auth is off). Raises
-    auth.AuthError on any auth/quota failure.
+    Returns None when auth is disabled (trusted single-tenant mode). Raises
+    auth.AuthError 401 when auth is on and the token is bad/missing. Does NOT
+    reserve quota; use `_reserve_job_quota` for that once refs are validated,
+    so a mistyped model ref doesn't eat the caller's daily budget.
+    """
+    client = _resolve_client()
+    return client.client_id if client else None
+
+
+def _reserve_job_quota() -> None:
+    """Reserve one job against the authenticated caller's daily budget.
+
+    No-op when auth is disabled. Raises auth.AuthError 429 when the quota is
+    exceeded. Call this AFTER `_authenticate` and AFTER the refs have been
+    validated, so a 400 for a bad ref doesn't consume the caller's budget.
     """
     client = _resolve_client()
     if client is None:
-        return None
+        return
     _auth_store().check_and_reserve(client, _client_active_jobs(client.client_id))
-    return client.client_id
+
+
+def _authorize_job_submission() -> Optional[str]:
+    """Back-compat wrapper: authenticate + reserve in one call. New endpoint
+    code should call `_authenticate` and `_reserve_job_quota` separately so a
+    bad-ref 400 doesn't consume quota."""
+    owner = _authenticate()
+    _reserve_job_quota()
+    return owner
 
 
 def _require_owner(job: "Job") -> None:
@@ -351,17 +375,55 @@ def _require_owner(job: "Job") -> None:
         abort(404)
 
 
+# ---- ownership for uploads / datasets / job artifacts ------------------------
+#
+# Public deployments share one filesystem across every anonymous visitor, so
+# each upload / dataset / job dir gets a plain `.owner` file holding the
+# client_id that created it. Listings filter by this value and resolvers refuse
+# to turn a `upload://` / `dataset://` / `job://` ref into a path for anyone
+# else's artifact. Dirs with no `.owner` file are treated as unowned and are
+# only visible when auth is disabled (dev / trusted mode).
+
+def _write_owner(dir_path: Path, owner: Optional[str]) -> None:
+    """Record `owner` as the creator of this artifact dir. Silent on IO error:
+    a missing .owner file simply makes the artifact inaccessible to any
+    authenticated caller, which is the safe default."""
+    if not owner:
+        return
+    try:
+        (dir_path / ".owner").write_text(owner)
+    except OSError:
+        pass
+
+
+def _read_owner(dir_path: Path) -> Optional[str]:
+    try:
+        txt = (dir_path / ".owner").read_text().strip()
+        return txt or None
+    except OSError:
+        return None
+
+
+def _owns(dir_path: Path, owner: Optional[str]) -> bool:
+    """True if `owner` may use this upload/dataset/job dir. When auth is off
+    (owner is None), everything is accessible, matching single-tenant mode."""
+    if owner is None:
+        return True
+    return _read_owner(dir_path) == owner
+
+
 # ---- model-reference resolution ---------------------------------------------
 
 _HF_ID = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$")
 
 
-def resolve_model_ref(ref: str) -> str:
+def resolve_model_ref(ref: str, owner: Optional[str] = None) -> str:
     """Turn a frontend model reference into a path/HF id the CLI can consume.
 
     Accepted forms (all resolved at request time):
         upload://<token>      -> /app/uploads/<token>
         server://<name>       -> <MERGESE_CHECKPOINTS>/<name>
+        job://<id>[/<sub>]    -> <ARTIFACTS>/<id>/<sub>  (sub: merged|exported)
         hf://<org>/<model>    -> <org>/<model>
         microsoft/codebert    -> HF id (default for bare strings)
         /abs/path             -> absolute path (ONLY when ALLOW_LOCAL_PATHS=1)
@@ -369,6 +431,11 @@ def resolve_model_ref(ref: str) -> str:
     Any path returned is verified to exist and be contained within its
     expected root - uploads can't escape UPLOADS_ROOT, server refs can't
     escape CHECKPOINTS_ROOT, etc.
+
+    `owner` is the authenticated caller's client id (None when auth is off).
+    `upload://` and `job://` refs are refused for anyone other than the owner,
+    with the same error message as a missing artifact so existence does not
+    leak between callers.
     """
     if not ref:
         raise ValueError("empty model reference")
@@ -380,7 +447,7 @@ def resolve_model_ref(ref: str) -> str:
         path = (UPLOADS_ROOT / token).resolve()
         if not str(path).startswith(str(UPLOADS_ROOT.resolve())):
             raise ValueError("upload path escapes uploads root")
-        if not path.exists():
+        if not path.exists() or not _owns(path, owner):
             raise ValueError(f"upload not found: {token}")
         return str(path)
 
@@ -407,7 +474,7 @@ def resolve_model_ref(ref: str) -> str:
             raise ValueError(f"bad job id in ref: {jid!r}")
         sub = parts[1] if len(parts) > 1 else None
         root = ARTIFACTS_ROOT.resolve() / jid
-        if not root.exists():
+        if not root.exists() or not _owns(root, owner):
             raise ValueError(f"job artifact not found: {jid}")
         if sub:
             if sub not in ("merged", "exported"):
@@ -452,8 +519,13 @@ def resolve_model_ref(ref: str) -> str:
 #                            -> datasets.load_dataset(id) -> mapped to CSV at request time
 #   /abs/path/to.csv         -> only when ALLOW_LOCAL_PATHS=1
 
-def resolve_dataset_ref(ref: str) -> str:
-    """Resolve a frontend dataset reference into a CSV path the CLI can read."""
+def resolve_dataset_ref(ref: str, owner: Optional[str] = None) -> str:
+    """Resolve a frontend dataset reference into a CSV path the CLI can read.
+
+    `owner` is the authenticated caller's client id (None when auth is off).
+    `dataset://` refs are refused for anyone other than the uploader, with the
+    same error as a missing dataset so existence does not leak between callers.
+    """
     if not ref:
         raise ValueError("empty dataset reference")
 
@@ -475,10 +547,11 @@ def resolve_dataset_ref(ref: str) -> str:
         token = ref[len("dataset://"):].strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", token):
             raise ValueError(f"bad dataset token: {token!r}")
-        path = (DATASET_UPLOADS_ROOT / token / "data.csv").resolve()
+        dir_path = (DATASET_UPLOADS_ROOT / token).resolve()
+        path = (dir_path / "data.csv").resolve()
         if not str(path).startswith(str(DATASET_UPLOADS_ROOT.resolve())):
             raise ValueError("dataset path escapes uploads root")
-        if not path.exists():
+        if not path.exists() or not _owns(dir_path, owner):
             raise ValueError(f"uploaded dataset not found: {token}")
         return str(path)
 
@@ -612,6 +685,9 @@ def _new_job(kind: str, cli_args: List[str], params: dict,
     else:
         job_dir = ARTIFACTS_ROOT / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
+    # Stamp the owner onto the artifact dir so job:// refs can be ownership-
+    # checked after a server restart, when the in-memory JOBS dict is empty.
+    _write_owner(job_dir, owner)
     log_path = job_dir / "log.txt"
     result_path = (job_dir / result_basename) if result_basename else None
 
@@ -857,6 +933,44 @@ app.url_map.strict_slashes = False
 CORS(app)
 
 
+# ---- security response headers ----------------------------------------------
+#
+# The deployment runs behind nginx + TLS, but setting these at the application
+# layer means they apply the same way whether the app is served through nginx,
+# gunicorn direct, or `python server/app.py` in dev. The CSP is intentionally
+# narrow: the only off-origin resource the UI loads is the Cloudflare
+# Turnstile widget, which must be explicitly allow-listed in script-src and
+# frame-src for the challenge iframe to render.
+_CSP = (
+    "default-src 'self'; "
+    "img-src 'self' data:; "
+    "style-src 'self' 'unsafe-inline'; "
+    "script-src 'self' https://challenges.cloudflare.com; "
+    "frame-src https://challenges.cloudflare.com; "
+    "connect-src 'self' https://challenges.cloudflare.com; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
+
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers.setdefault("Content-Security-Policy", _CSP)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    # Only advertise HSTS on an HTTPS request. In dev the app may be hit over
+    # plain HTTP; setting HSTS there would still work but is unhelpful noise.
+    if request.is_secure or request.headers.get("X-Forwarded-Proto") == "https":
+        resp.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
+    return resp
+
+
 @app.route("/")
 def index():
     return send_from_directory(str(FRONTEND), "index.html")
@@ -887,6 +1001,7 @@ def _cli_version() -> str:
 
 @app.route("/api/inspect", methods=["POST"])
 def api_inspect():
+    owner = _authenticate()
     body = request.get_json(force=True) or {}
     models = body.get("models") or []
     base = body.get("base")
@@ -896,11 +1011,11 @@ def api_inspect():
     if over:
         return over
     try:
-        resolved_models = [resolve_model_ref(m) for m in models]
-        resolved_base = resolve_model_ref(base) if base else None
+        resolved_models = [resolve_model_ref(m, owner=owner) for m in models]
+        resolved_base = resolve_model_ref(base, owner=owner) if base else None
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    owner = _authorize_job_submission()
+    _reserve_job_quota()
     args = ["inspect", *resolved_models]
     if resolved_base:
         args.extend(["--base", resolved_base])
@@ -913,6 +1028,7 @@ def api_inspect():
 
 @app.route("/api/merge", methods=["POST"])
 def api_merge():
+    owner = _authenticate()
     body = request.get_json(force=True) or {}
     models = body.get("models") or []
     base = body.get("base")
@@ -935,13 +1051,14 @@ def api_merge():
         return over
 
     try:
-        resolved_models = [resolve_model_ref(m) for m in models]
-        resolved_base = resolve_model_ref(base)
+        resolved_models = [resolve_model_ref(m, owner=owner) for m in models]
+        resolved_base = resolve_model_ref(base, owner=owner)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    owner = _authorize_job_submission()
+    _reserve_job_quota()
     job_id, job_dir = _allocate_job_id()
+    _write_owner(job_dir, owner)
     out_dir = job_dir / "merged"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -980,6 +1097,7 @@ def api_merge():
 
 @app.route("/api/evaluate", methods=["POST"])
 def api_evaluate():
+    owner = _authenticate()
     body = request.get_json(force=True) or {}
     model = body.get("model")
     task = body.get("task", "clone_detection")
@@ -996,10 +1114,9 @@ def api_evaluate():
 
     metric = body.get("metric", "auto")
     try:
-        resolved_model = resolve_model_ref(model)
+        resolved_model = resolve_model_ref(model, owner=owner)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    owner = _authorize_job_submission()
 
     # Unified dataset reference handling: the frontend sends one `dataset_ref`
     # using bundled:// / dataset:// / hf-dataset:// / server-dataset://. Older
@@ -1013,7 +1130,7 @@ def api_evaluate():
     dataset_ref = body.get("dataset_ref")
     if dataset_ref:
         try:
-            csv_path = resolve_dataset_ref(dataset_ref)
+            csv_path = resolve_dataset_ref(dataset_ref, owner=owner)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         args.extend(["--test-file", csv_path])
@@ -1023,6 +1140,7 @@ def api_evaluate():
         if test_file:
             args.extend(["--test-file", test_file])
 
+    _reserve_job_quota()
     job = _new_job("evaluate", args, body, result_basename="metrics.json", owner=owner)
     return jsonify({"job_id": job.id, "status": job.status}), 202
 
@@ -1031,6 +1149,7 @@ def api_evaluate():
 
 @app.route("/api/export", methods=["POST"])
 def api_export():
+    owner = _authenticate()
     body = request.get_json(force=True) or {}
     model = body.get("model")
     fmt = body.get("format", "huggingface")
@@ -1041,12 +1160,13 @@ def api_export():
         return over
 
     try:
-        resolved_model = resolve_model_ref(model)
+        resolved_model = resolve_model_ref(model, owner=owner)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    owner = _authorize_job_submission()
+    _reserve_job_quota()
     job_id, base_out = _allocate_job_id()
+    _write_owner(base_out, owner)
     if fmt == "huggingface":
         out_path = base_out / "exported"
     elif fmt == "onnx":
@@ -1154,7 +1274,13 @@ def api_job_cancel(job_id: str):
 
 @app.route("/api/checkpoints")
 def api_checkpoints():
-    """List checkpoint directories under MERGESE_CHECKPOINTS (if configured)."""
+    """List checkpoint directories under MERGESE_CHECKPOINTS (if configured).
+
+    These are operator-mounted, globally visible to anyone who can run a merge,
+    so the listing is behind the same authentication wall as the compute
+    endpoints to avoid advertising server-side filesystem layout anonymously.
+    """
+    _authenticate()
     if not CHECKPOINTS_ROOT:
         return jsonify({"root": None, "entries": [], "note": "MERGESE_CHECKPOINTS not set"})
     root = Path(CHECKPOINTS_ROOT)
@@ -1340,7 +1466,7 @@ def api_upload():
 
     Returns: { token, ref: "upload://<token>", size, files: [...] }
     """
-    _resolve_client()  # require a valid identity when auth is on
+    owner = _authenticate()
     label = secure_filename((request.form.get("label") or "").strip())[:64] or None
 
     if "file" in request.files:
@@ -1379,6 +1505,7 @@ def api_upload():
             size = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
             if label:
                 (d / ".label").write_text(label)
+            _write_owner(d, owner)
             return jsonify({
                 "token": token,
                 "ref": f"upload://{token}",
@@ -1419,6 +1546,7 @@ def api_upload():
             size = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
             if label:
                 (d / ".label").write_text(label)
+            _write_owner(d, owner)
             return jsonify({
                 "token": token,
                 "ref": f"upload://{token}",
@@ -1441,14 +1569,19 @@ def api_library():
         uploads, server, jobs, suggestions
     Datasets groups (returned under `datasets`):
         bundled, uploads, server, suggestions
+
+    Uploads, dataset-uploads, and finished-job outputs are scoped to the
+    authenticated caller - a visitor only ever sees their own artifacts in
+    the picker. Server-mounted checkpoints and bundled datasets are global.
     """
+    owner = _authenticate()
     out = {"uploads": [], "server": [], "jobs": [], "suggestions": [],
            "datasets": {"bundled": [], "uploads": [], "server": [], "suggestions": []}}
 
-    # uploads
+    # uploads (scoped to caller)
     if UPLOADS_ROOT.exists():
         for d in sorted(UPLOADS_ROOT.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-            if not d.is_dir():
+            if not d.is_dir() or not _owns(d, owner):
                 continue
             label_path = d / ".label"
             label = label_path.read_text().strip() if label_path.exists() else None
@@ -1460,7 +1593,7 @@ def api_library():
                 "mtime": d.stat().st_mtime,
             })
 
-    # server-mounted
+    # server-mounted (global; operator-provided, not user content)
     if CHECKPOINTS_ROOT:
         root = Path(CHECKPOINTS_ROOT)
         if root.exists():
@@ -1473,9 +1606,11 @@ def api_library():
                         "size": size,
                     })
 
-    # finished merge/export job outputs
+    # finished merge/export job outputs (scoped to caller)
     with JOBS_LOCK:
-        snap = [j for j in JOBS.values() if j.kind in ("merge", "export") and j.status == "done"]
+        snap = [j for j in JOBS.values()
+                if j.kind in ("merge", "export") and j.status == "done"
+                and (owner is None or j.owner == owner)]
     for job in sorted(snap, key=lambda j: -(j.finished_at or 0))[:20]:
         for sub in ("merged", "exported"):
             cand = ARTIFACTS_ROOT / job.id / sub
@@ -1513,11 +1648,11 @@ def api_library():
             "description": b.get("description", ""),
         })
 
-    # Uploaded datasets
+    # Uploaded datasets (scoped to caller)
     if DATASET_UPLOADS_ROOT.exists():
         for d in sorted(DATASET_UPLOADS_ROOT.iterdir(),
                         key=lambda x: x.stat().st_mtime, reverse=True):
-            if not d.is_dir():
+            if not d.is_dir() or not _owns(d, owner):
                 continue
             csv = d / "data.csv"
             if not csv.exists():
@@ -1564,6 +1699,7 @@ def api_upload_dataset():
     """
     import csv as _csv
 
+    owner = _authenticate()
     label = secure_filename((request.form.get("label") or "").strip())[:64] or None
 
     f = request.files.get("file") or next(iter(request.files.values()), None)
@@ -1620,6 +1756,7 @@ def api_upload_dataset():
 
         if label:
             (d / ".label").write_text(label)
+        _write_owner(d, owner)
         return jsonify({
             "token": token,
             "ref": f"dataset://{token}",
@@ -1635,11 +1772,12 @@ def api_upload_dataset():
 
 @app.route("/api/datasets", methods=["GET"])
 def api_datasets_list():
+    owner = _authenticate()
     items = []
     if DATASET_UPLOADS_ROOT.exists():
         for d in sorted(DATASET_UPLOADS_ROOT.iterdir(),
                         key=lambda x: x.stat().st_mtime, reverse=True):
-            if not d.is_dir():
+            if not d.is_dir() or not _owns(d, owner):
                 continue
             csv = d / "data.csv"
             if not csv.exists():
@@ -1657,10 +1795,12 @@ def api_datasets_list():
 
 @app.route("/api/datasets/<token>", methods=["DELETE"])
 def api_dataset_delete(token: str):
+    owner = _authenticate()
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", token):
         return jsonify({"error": "bad token"}), 400
     d = DATASET_UPLOADS_ROOT / token
-    if not d.exists():
+    if not d.exists() or not _owns(d, owner):
+        # Return 404 (not 403) so one caller cannot probe another caller's tokens.
         return jsonify({"error": "not found"}), 404
     shutil.rmtree(d, ignore_errors=True)
     return jsonify({"ok": True})
@@ -1668,10 +1808,11 @@ def api_dataset_delete(token: str):
 
 @app.route("/api/uploads")
 def api_uploads_list():
+    owner = _authenticate()
     items = []
     if UPLOADS_ROOT.exists():
         for d in sorted(UPLOADS_ROOT.iterdir()):
-            if not d.is_dir():
+            if not d.is_dir() or not _owns(d, owner):
                 continue
             label_path = d / ".label"
             label = label_path.read_text().strip() if label_path.exists() else None
@@ -1690,10 +1831,12 @@ def api_uploads_list():
 
 @app.route("/api/uploads/<token>", methods=["DELETE"])
 def api_upload_delete(token: str):
+    owner = _authenticate()
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", token):
         return jsonify({"error": "bad token"}), 400
     d = _upload_dir(token)
-    if not d.exists():
+    if not d.exists() or not _owns(d, owner):
+        # Return 404 (not 403) so one caller cannot probe another caller's tokens.
         return jsonify({"error": "not found"}), 404
     shutil.rmtree(d, ignore_errors=True)
     return jsonify({"ok": True})

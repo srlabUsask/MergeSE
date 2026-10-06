@@ -137,6 +137,20 @@ async function api(path, opts = {}) {
     showGate("Your session expired - please verify again.");
     throw new Error("session expired");
   }
+  if (res.status === 429) {
+    // Either the per-caller daily/active-job quota is used up, or the global
+    // queue is saturated. Surface the server's hint (and any Retry-After)
+    // instead of a bare "Too Many Requests".
+    let msg = "rate-limited: too many jobs in flight";
+    try { const j = await res.json(); msg = j.error || msg; } catch (_) {}
+    const retry = res.headers.get("Retry-After");
+    if (retry) msg += ` (retry in ${retry}s)`;
+    throw new Error(msg);
+  }
+  if (res.status === 503) {
+    // nginx throws 503 when the per-IP rate limit zone's burst is exceeded.
+    throw new Error("too many requests - please slow down and try again");
+  }
   if (!res.ok) {
     let msg = res.statusText;
     try { const j = await res.json(); msg = j.error || msg; } catch (_) {}
