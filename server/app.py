@@ -749,6 +749,132 @@ def _cmd_needs_network(cmd: List[str]) -> bool:
     return False
 
 
+def _uncached_hf_ids_in_cmd(cmd: List[str]) -> List[str]:
+    """Return the uncached HF ids present in `cmd`, preserving order & dedup."""
+    out, seen = [], set()
+    for tok in cmd:
+        if tok in seen:
+            continue
+        if tok.startswith("-") or os.path.isabs(tok) or os.sep in tok and Path(tok).exists():
+            continue
+        if _HF_ID.match(tok) and "/" in tok and not Path(tok).exists():
+            if not _hf_id_is_cached(tok):
+                out.append(tok); seen.add(tok)
+    return out
+
+
+def _cached_hf_snapshot_path(hf_id: str) -> Optional[str]:
+    """Resolve a cached HF id to the local snapshot path (`refs/main` revision
+    when present, else any snapshot). Returns None if the id isn't cached."""
+    folder = "models--" + hf_id.replace("/", "--")
+    model_dir = _hf_cache_root() / folder
+    ref = model_dir / "refs" / "main"
+    try:
+        if ref.exists():
+            rev = ref.read_text().strip()
+            snap = model_dir / "snapshots" / rev
+            if snap.is_dir():
+                return str(snap)
+    except OSError:
+        pass
+    snaps = model_dir / "snapshots"
+    if snaps.is_dir():
+        for s in sorted(snaps.iterdir()):
+            if s.is_dir():
+                return str(s)
+    return None
+
+
+def _rewrite_hf_ids_to_local_paths(cmd: List[str]) -> List[str]:
+    """Replace every cached HF id in `cmd` with its local snapshot path.
+
+    `AutoModel.from_pretrained(<path>)` works under TRANSFORMERS_OFFLINE on
+    every transformers version we care about, while `from_pretrained(<id>)`
+    fails to resolve the cache in some v4.x releases. Rewriting the cmd is
+    a cheap belt-and-suspenders against that regression. Uncached ids are
+    left as-is so the "needs network" refusal path can still catch them.
+    """
+    out = []
+    for tok in cmd:
+        if (
+            tok.startswith("-")
+            or os.path.isabs(tok)
+            or (os.sep in tok and Path(tok).exists())
+        ):
+            out.append(tok); continue
+        if _HF_ID.match(tok) and "/" in tok and not Path(tok).exists():
+            local = _cached_hf_snapshot_path(tok)
+            if local:
+                out.append(local); continue
+        out.append(tok)
+    return out
+
+
+# ---- HF auto-prefetch --------------------------------------------------------
+#
+# The merge worker runs inside a stripped network namespace, so by itself it
+# cannot download a model from the Hub. But the Flask process DOES have network,
+# so when a job references an HF id that isn't cached yet we can grab it in the
+# parent before the sandboxed child starts. This lets a visitor type any public
+# HF Hub id (not just the pre-cached suggestions) and have it work.
+#
+# Guards:
+#   - Only `org/name` shaped tokens are considered (`_HF_ID.match` + "/" in it).
+#   - A per-model size cap stops a visitor from hooking us into a 50 GB llama
+#     checkpoint. Set MERGESE_HF_PREFETCH_MAX_BYTES=0 to disable the cap.
+#   - MERGESE_HF_AUTO_PREFETCH=0 reverts to the old "refuse offline" behaviour.
+#   - The job stays in `running` state throughout the download; progress goes to
+#     the job log file so visitors can watch it stream.
+HF_AUTO_PREFETCH = bool(int(os.environ.get("MERGESE_HF_AUTO_PREFETCH", "1")))
+HF_PREFETCH_MAX_BYTES = int(
+    os.environ.get("MERGESE_HF_PREFETCH_MAX_BYTES", str(5 * 1024 ** 3))  # 5 GB
+)
+
+
+def _prefetch_hf_id(hf_id: str, log) -> str:
+    """Download `hf_id` into HF_HOME synchronously, return the local snapshot
+    path.
+
+    The returned path is handed back so the caller can rewrite the worker's
+    cmd to load from a filesystem path rather than the HF id. We do this
+    because some combinations of transformers + huggingface_hub refuse to
+    resolve an id -> local snapshot under TRANSFORMERS_OFFLINE=1 (even when
+    the files are plainly in HF_HOME/hub); the sandboxed worker has no
+    network to retry, and `AutoModel.from_pretrained(path)` always works.
+
+    Writes progress lines into the open `log` file so a visitor can follow it
+    through /api/jobs/<id>/stream. Raises `ValueError` with an actionable
+    message on any failure (lookup failed, too large, download failed) so the
+    caller can mark the job as `error` with a useful summary.
+    """
+    from huggingface_hub import HfApi, snapshot_download
+    log.write(f"[prefetch] looking up {hf_id} on HuggingFace Hub...\n".encode())
+    try:
+        info = HfApi().model_info(hf_id, files_metadata=True)
+    except Exception as e:
+        raise ValueError(f"could not look up {hf_id} on HF Hub: {e}")
+    sizes = [getattr(f, "size", None) or 0 for f in (getattr(info, "siblings", []) or [])]
+    total = sum(sizes)
+    gb = total / (1024 ** 3)
+    if HF_PREFETCH_MAX_BYTES > 0 and total > HF_PREFETCH_MAX_BYTES:
+        cap_gb = HF_PREFETCH_MAX_BYTES / (1024 ** 3)
+        raise ValueError(
+            f"refusing to auto-prefetch {hf_id}: "
+            f"{gb:.1f} GB > {cap_gb:.1f} GB operator limit. "
+            f"Ask the operator to pre-cache this model, or upload safetensors directly."
+        )
+    log.write(
+        f"[prefetch] downloading {hf_id} ({gb:.2f} GB, {len(sizes)} files)...\n"
+        .encode()
+    )
+    try:
+        local_path = snapshot_download(hf_id)
+    except Exception as e:
+        raise ValueError(f"could not download {hf_id}: {e}")
+    log.write(f"[prefetch] done: {hf_id} -> {local_path}\n".encode())
+    return local_path
+
+
 def _rlimit_preexec():
     """Applied in the worker child before exec: rlimits + new session.
 
@@ -823,29 +949,47 @@ def _build_worker(job: Job, logf) -> subprocess.Popen:
 
 def _run_job(job: Job) -> None:
     with RUN_SEMA:
-        # A job that needs a Hub download cannot run in the offline namespace.
-        # Refuse it up front with an actionable message rather than letting it
-        # fail deep inside transformers with an opaque offline error.
-        if job.needs_network and WORKER_OFFLINE and NETNS_OK:
-            with JOBS_LOCK:
-                job.status = "error"
-                job.started_at = job.started_at or time.time()
-                job.finished_at = time.time()
-                job.error = ("this job references a HuggingFace model that is not "
-                             "cached on the server. The merge worker runs offline, "
-                             "so ask the operator to pre-fetch the model, or upload "
-                             "safetensors weights directly.")
-            try:
-                job.log_path.write_text("[mergese] refused: model not available "
-                                        "offline (worker has no network).\n")
-            except OSError:
-                pass
-            return
         with JOBS_LOCK:
             job.status = "running"
             job.started_at = time.time()
         try:
             with open(job.log_path, "wb", buffering=0) as logf:
+                # If the job wants an uncached HF id and auto-prefetch is on,
+                # grab it in the Flask parent (which has network) before the
+                # sandboxed worker starts. On failure, write the reason to the
+                # log and mark the job errored - DO NOT fall through to the
+                # worker (which would just hit an opaque offline-cache miss).
+                if job.needs_network and WORKER_OFFLINE and NETNS_OK:
+                    if HF_AUTO_PREFETCH:
+                        try:
+                            for hf_id in _uncached_hf_ids_in_cmd(job.cmd):
+                                _prefetch_hf_id(hf_id, logf)
+                            # Re-check: everything we asked for should now be
+                            # cached.
+                            job.needs_network = _cmd_needs_network(job.cmd)
+                        except ValueError as e:
+                            logf.write(f"[prefetch] FAILED: {e}\n".encode())
+                            with JOBS_LOCK:
+                                job.status = "error"
+                                job.error = str(e)
+                                job.finished_at = time.time()
+                            return
+                    if job.needs_network:
+                        msg = ("this job references a HuggingFace model that is not "
+                               "cached on the server. The merge worker runs offline, "
+                               "so ask the operator to pre-fetch the model, or upload "
+                               "safetensors weights directly.")
+                        logf.write(f"[mergese] refused: {msg}\n".encode())
+                        with JOBS_LOCK:
+                            job.status = "error"
+                            job.error = msg
+                            job.finished_at = time.time()
+                        return
+                # Rewrite cached HF ids -> local snapshot paths. Always safe:
+                # `AutoModel.from_pretrained(<path>)` works offline regardless
+                # of transformers version, while `from_pretrained(<id>)` under
+                # TRANSFORMERS_OFFLINE fails on some v4.x releases.
+                job.cmd = _rewrite_hf_ids_to_local_paths(job.cmd)
                 proc = _build_worker(job, logf)
                 with JOBS_LOCK:
                     job.pid = proc.pid

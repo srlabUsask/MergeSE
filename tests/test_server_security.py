@@ -153,6 +153,87 @@ def test_cmd_needs_network_flags_uncached_id(monkeypatch, tmp_path):
     assert app._cmd_needs_network(["merge", str(tmp_path), "--flag"]) is False
 
 
+def test_uncached_hf_ids_in_cmd_dedupes_and_skips_locals(monkeypatch, tmp_path):
+    cache = tmp_path / "hf"
+    (cache / "hub" / "models--org--cached" / "snapshots" / "s").mkdir(parents=True)
+    app = _load_app(monkeypatch, tmp_path, HF_HOME=str(cache))
+    local = tmp_path / "a_local_model"; local.mkdir()
+    cmd = [
+        "merge",
+        "org/cached",            # cached -> skip
+        "org/uncached-a",        # include
+        "org/uncached-b",        # include
+        "org/uncached-a",        # duplicate -> skip
+        str(local),              # absolute path exists -> skip
+        "--flag",                # flag -> skip
+    ]
+    assert app._uncached_hf_ids_in_cmd(cmd) == ["org/uncached-a", "org/uncached-b"]
+
+
+def test_prefetch_rejects_oversized_model(monkeypatch, tmp_path):
+    """A visitor cannot steer the operator into downloading a 50 GB llama by
+    typing its id into the merge form. The size cap stops the fetch before
+    any bytes land on disk."""
+    app = _load_app(monkeypatch, tmp_path,
+                    HF_HOME=str(tmp_path / "hf"),
+                    MERGESE_HF_PREFETCH_MAX_BYTES="1048576")  # 1 MB cap
+
+    # Pretend the Hub says the model is 100 MB total across two files.
+    class _FakeFile:
+        def __init__(self, size): self.size = size
+    class _FakeInfo:
+        siblings = [_FakeFile(50 * 1024 * 1024), _FakeFile(50 * 1024 * 1024)]
+    class _FakeApi:
+        def model_info(self, hf_id, files_metadata=False): return _FakeInfo()
+
+    # Stub out the HF Hub module so no network is reached.
+    import types
+    hub = types.ModuleType("huggingface_hub")
+    hub.HfApi = lambda: _FakeApi()
+    hub.snapshot_download = lambda *a, **kw: pytest.fail(
+        "snapshot_download must NOT be called when the size cap is exceeded")
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+
+    buf = io.BytesIO()
+    with pytest.raises(ValueError) as ei:
+        app._prefetch_hf_id("huge/model", buf)
+    msg = str(ei.value).lower()
+    assert "refusing" in msg and "huge/model" in msg
+
+
+def test_prefetch_downloads_when_within_cap(monkeypatch, tmp_path):
+    app = _load_app(monkeypatch, tmp_path,
+                    HF_HOME=str(tmp_path / "hf"),
+                    MERGESE_HF_PREFETCH_MAX_BYTES=str(10 * 1024 * 1024))  # 10 MB cap
+
+    class _FakeFile:
+        def __init__(self, size): self.size = size
+    class _FakeInfo:
+        siblings = [_FakeFile(1024)]  # 1 KB total, well under cap
+    class _FakeApi:
+        def model_info(self, hf_id, files_metadata=False): return _FakeInfo()
+    called = {}
+    def _dl(hf_id, *a, **kw):
+        called["id"] = hf_id
+        return "/some/snapshot/path"
+    import types
+    hub = types.ModuleType("huggingface_hub")
+    hub.HfApi = lambda: _FakeApi()
+    hub.snapshot_download = _dl
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+
+    buf = io.BytesIO()
+    local_path = app._prefetch_hf_id("org/tiny", buf)
+    # The returned path is what the caller rewrites the worker's cmd to use.
+    assert local_path == "/some/snapshot/path"
+    assert called["id"] == "org/tiny"
+    # Progress is written to the log so visitors can watch it stream.
+    log = buf.getvalue().decode()
+    assert "looking up org/tiny" in log
+    assert "downloading org/tiny" in log
+    assert "/some/snapshot/path" in log
+
+
 def test_build_worker_uses_stripped_env_and_job_dir(monkeypatch, tmp_path):
     app = _load_app(monkeypatch, tmp_path)
     # A secret in the server env must NOT reach the worker.
@@ -180,3 +261,48 @@ def test_build_worker_uses_stripped_env_and_job_dir(monkeypatch, tmp_path):
     if app.NETNS_OK:
         assert captured["cmd"][0] == app._UNSHARE_BIN
         assert "-rn" in captured["cmd"]
+
+
+def test_cached_hf_snapshot_path_resolves_refs_main(monkeypatch, tmp_path):
+    """`_cached_hf_snapshot_path` must resolve a cached id by reading refs/main
+    and returning the matching snapshot. Needed because loading an HF id
+    directly offline is unreliable across transformers versions - we always
+    hand the worker the resolved path."""
+    cache = tmp_path / "hf"
+    model = cache / "hub" / "models--org--mini"
+    rev = "deadbeef" * 4
+    (model / "snapshots" / rev).mkdir(parents=True)
+    (model / "refs").mkdir()
+    (model / "refs" / "main").write_text(rev)
+    app = _load_app(monkeypatch, tmp_path, HF_HOME=str(cache))
+    assert app._cached_hf_snapshot_path("org/mini") == str(model / "snapshots" / rev)
+    # Unknown id -> None
+    assert app._cached_hf_snapshot_path("org/not-cached") is None
+
+
+def test_rewrite_hf_ids_to_local_paths(monkeypatch, tmp_path):
+    cache = tmp_path / "hf"
+    model = cache / "hub" / "models--org--cached"
+    rev = "abc1234567890abc"
+    (model / "snapshots" / rev).mkdir(parents=True)
+    (model / "refs").mkdir()
+    (model / "refs" / "main").write_text(rev)
+    app = _load_app(monkeypatch, tmp_path, HF_HOME=str(cache))
+    local_abs = str(tmp_path / "already_a_path"); Path(local_abs).mkdir()
+    cmd = [
+        "merge",
+        "org/cached",         # -> rewrite to local snapshot
+        "org/not-cached",     # -> leave as id (caller will refuse later)
+        local_abs,            # -> leave: absolute path
+        "--trim-percentile",  # -> leave: flag
+        "20",                 # -> leave: numeric literal, no slash
+    ]
+    out = app._rewrite_hf_ids_to_local_paths(cmd)
+    assert out == [
+        "merge",
+        str(model / "snapshots" / rev),
+        "org/not-cached",
+        local_abs,
+        "--trim-percentile",
+        "20",
+    ]
