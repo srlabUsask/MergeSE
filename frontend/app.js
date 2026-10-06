@@ -848,33 +848,49 @@ const METHOD_DEFAULTS = {
                  pcbHint:  "not used by averaging (only PCB)" },
 };
 
+// Toggle visibility of the <label> wrapping `input`. Grid auto-flow collapses
+// the hidden cell so the remaining fields reflow without a gap.
+function _toggleField(input, show) {
+  if (!input) return;
+  const label = input.closest("label");
+  if (label) label.hidden = !show;
+}
+
 function applyMethodDefaults(method, opts = {}) {
   const d = METHOD_DEFAULTS[method] || METHOD_DEFAULTS.ties;
   const trim = $("#mTrim"), drop = $("#mDrop");
   const wudiSteps = $("#mWudiSteps"), wudiLr = $("#mWudiLr");
   const pcbRatio = $("#mPcbRatio"), pcbLambda = $("#mPcbLambda"), pcbScope = $("#mPcbScope");
-  // overwrite=true on method-change events; overwrite=false on initial render
-  // (we still want the field disabled state to reflect the method, but we
-  // don't want to clobber a value the user just typed).
+
+  // Reset values to the method's recommended defaults on an explicit method
+  // change (overwrite=true, the default). On initial render / preset load we
+  // keep whatever is already in the field so a user's manual edits survive.
   if (opts.overwrite !== false) {
-    trim.value = d.trim;
-    drop.value = d.drop;
-    if (pcbRatio && d.pcbRatio  !== undefined) pcbRatio.value  = d.pcbRatio;
-    if (pcbLambda && d.pcbLambda !== undefined) pcbLambda.value = d.pcbLambda;
-    if (pcbScope && d.pcbScope  !== undefined) pcbScope.value  = d.pcbScope;
+    if (d.trimEnabled && trim)  trim.value = d.trim;
+    if (d.dropEnabled && drop)  drop.value = d.drop;
+    if (d.pcbEnabled && pcbRatio  && d.pcbRatio  !== undefined) pcbRatio.value  = d.pcbRatio;
+    if (d.pcbEnabled && pcbLambda && d.pcbLambda !== undefined) pcbLambda.value = d.pcbLambda;
+    if (d.pcbEnabled && pcbScope  && d.pcbScope  !== undefined) pcbScope.value  = d.pcbScope;
   }
-  trim.disabled = !d.trimEnabled;
-  drop.disabled = !d.dropEnabled;
-  $("#mTrimHint").textContent = d.trimHint;
-  $("#mDropHint").textContent = d.dropHint;
-  if (wudiSteps && wudiLr) {
-    wudiSteps.disabled = !d.wudiEnabled;
-    wudiLr.disabled = !d.wudiEnabled;
+
+  // Show only the knobs this method uses. Hiding, not disabling, so the form
+  // doesn't present a wall of grayed-out "ignored" rows to a first-time user.
+  _toggleField(trim,      d.trimEnabled);
+  _toggleField(drop,      d.dropEnabled);
+  _toggleField(wudiSteps, d.wudiEnabled);
+  _toggleField(wudiLr,    d.wudiEnabled);
+  _toggleField(pcbRatio,  d.pcbEnabled);
+  _toggleField(pcbLambda, d.pcbEnabled);
+  _toggleField(pcbScope,  d.pcbEnabled);
+
+  // Only populate hints on the fields that are visible.
+  if (d.trimEnabled) $("#mTrimHint").textContent = d.trimHint;
+  if (d.dropEnabled) $("#mDropHint").textContent = d.dropHint;
+  if (d.wudiEnabled) {
     $("#mWudiStepsHint").textContent = d.wudiHint;
-    $("#mWudiLrHint").textContent = d.wudiHint;
+    $("#mWudiLrHint").textContent    = d.wudiHint;
   }
-  if (pcbRatio && pcbLambda && pcbScope) {
-    pcbRatio.disabled = pcbLambda.disabled = pcbScope.disabled = !d.pcbEnabled;
+  if (d.pcbEnabled) {
     $("#mPcbRatioHint").textContent  = d.pcbHint;
     $("#mPcbLambdaHint").textContent = d.pcbHint;
     $("#mPcbScopeHint").textContent  = d.pcbHint;
@@ -900,21 +916,34 @@ function bindForms() {
     const encoder_only = heads === "encoder_only" ? true
                        : heads === "include"      ? false
                        : null;
-    submit("/api/merge", {
-      models, base,
-      method: $("#mMethod").value,
-      trim_percentile: parseFloat($("#mTrim").value),
-      drop_rate: parseFloat($("#mDrop").value),
-      wudi_steps: parseInt($("#mWudiSteps").value, 10),
-      wudi_lr: parseFloat($("#mWudiLr").value),
-      pcb_ratio: parseFloat($("#mPcbRatio").value),
-      pcb_lambda: parseFloat($("#mPcbLambda").value),
-      pcb_scope: $("#mPcbScope").value,
+    const method = $("#mMethod").value;
+    // Only send the knobs that this method actually uses. Sending PCB knobs on
+    // a TIES merge (or vice-versa) was harmless on the server, but it put bogus
+    // --pcb-ratio flags on the CLI invocation and made the sent payload look
+    // misleading when inspected in the browser devtools.
+    const body = {
+      models, base, method,
       weights: $("#mWeights").value.trim() || null,
       seed: parseInt($("#mSeed").value, 10),
       task: $("#mTask") ? ($("#mTask").value || null) : null,
       encoder_only,
-    }, { kind: "merge" });
+    };
+    if (method === "ties" || method === "dare-ties") {
+      body.trim_percentile = parseFloat($("#mTrim").value);
+    }
+    if (method === "dare-ties") {
+      body.drop_rate = parseFloat($("#mDrop").value);
+    }
+    if (method === "wudi") {
+      body.wudi_steps = parseInt($("#mWudiSteps").value, 10);
+      body.wudi_lr    = parseFloat($("#mWudiLr").value);
+    }
+    if (method === "pcb") {
+      body.pcb_ratio  = parseFloat($("#mPcbRatio").value);
+      body.pcb_lambda = parseFloat($("#mPcbLambda").value);
+      body.pcb_scope  = $("#mPcbScope").value;
+    }
+    submit("/api/merge", body, { kind: "merge" });
   });
 
   $("#evalForm").addEventListener("submit", (ev) => {

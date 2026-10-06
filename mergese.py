@@ -397,18 +397,58 @@ def _dare_drop(
     return out
 
 
+def _all_delta_keys(
+    deltas: Sequence[Dict[str, "torch.Tensor"]],  # type: ignore[name-defined]
+) -> List[str]:
+    """Union of parameter names across every delta, preserving the order each
+    name first appears. The per-model deltas are filtered to shape-matching
+    keys by `_compute_task_vector`, so when the inputs disagree on embedding
+    size or vocab (e.g. CodeBERT 50265 vs UniXcoder 51416) their keysets will
+    differ. The merge drivers must walk the union, not whichever model happens
+    to be at index 0, otherwise a key missing from `deltas[0]` is silently
+    dropped from the merge."""
+    seen: set = set()
+    out: List[str] = []
+    for d in deltas:
+        for k in d:
+            if k not in seen:
+                seen.add(k)
+                out.append(k)
+    return out
+
+
+def _first_with_key(
+    deltas: Sequence[Dict[str, "torch.Tensor"]],  # type: ignore[name-defined]
+    name: str,
+) -> "torch.Tensor":                              # type: ignore[name-defined]
+    """First delta containing `name`. Used only to size a zeros_like scratch."""
+    for d in deltas:
+        if name in d:
+            return d[name]
+    raise KeyError(name)  # unreachable when `name` came from `_all_delta_keys`
+
+
 def _elect_sign(
     deltas: Sequence[Dict[str, "torch.Tensor"]],  # type: ignore[name-defined]
     weights: Sequence[float],
 ) -> Dict[str, "torch.Tensor"]:                  # type: ignore[name-defined]
-    """Per-parameter majority sign, weighted by magnitude * lambda_k."""
+    """Per-parameter majority sign, weighted by magnitude * lambda_k.
+
+    Models whose delta is missing a given param (because the corresponding
+    tensor had a different shape than the base, and so was filtered out of
+    that model's task vector) do not contribute to the sign election for
+    that param; they're treated as a zero vote, which is identical to not
+    including that model for that tensor at all.
+    """
     torch = _lazy_torch()
     signs: Dict[str, "torch.Tensor"] = {}  # type: ignore[name-defined]
-    keys = deltas[0].keys()
-    for name in keys:
-        score = torch.zeros_like(deltas[0][name])
+    for name in _all_delta_keys(deltas):
+        score = torch.zeros_like(_first_with_key(deltas, name))
         for k, d in enumerate(deltas):
-            score = score + weights[k] * d[name]
+            t = d.get(name)
+            if t is None:
+                continue
+            score = score + weights[k] * t
         signs[name] = score.sign()
     return signs
 
@@ -418,20 +458,31 @@ def _merge_with_signs(
     weights: Sequence[float],
     elected: Dict[str, "torch.Tensor"],          # type: ignore[name-defined]
 ) -> Tuple[Dict[str, "torch.Tensor"], float]:    # type: ignore[name-defined]
-    """Keep only entries whose sign matches the elected sign; average the rest."""
+    """Keep only entries whose sign matches the elected sign; average the rest.
+
+    As with `_elect_sign`, a model missing a given param contributes nothing
+    to that param's merged value - its weight is just excluded from the
+    denominator for that tensor.
+    """
     torch = _lazy_torch()
     merged: Dict[str, "torch.Tensor"] = {}  # type: ignore[name-defined]
     total = 0
     conflicts = 0
-    for name in deltas[0].keys():
-        agg = torch.zeros_like(deltas[0][name])
-        kept_count = torch.zeros_like(deltas[0][name])
+    for name in _all_delta_keys(deltas):
+        if name not in elected:
+            continue  # defensive: should not happen when elected came from _elect_sign
+        ref = _first_with_key(deltas, name)
+        agg = torch.zeros_like(ref)
+        kept_count = torch.zeros_like(ref)
         for k, d in enumerate(deltas):
-            agree = (d[name].sign() == elected[name]) & (elected[name] != 0)
-            agg = agg + weights[k] * d[name] * agree.float()
+            t = d.get(name)
+            if t is None:
+                continue
+            agree = (t.sign() == elected[name]) & (elected[name] != 0)
+            agg = agg + weights[k] * t * agree.float()
             kept_count = kept_count + agree.float()
-            conflicts += int(((d[name].sign() != elected[name]) & (d[name] != 0) & (elected[name] != 0)).sum().item())
-            total += int((d[name] != 0).sum().item())
+            conflicts += int(((t.sign() != elected[name]) & (t != 0) & (elected[name] != 0)).sum().item())
+            total += int((t != 0).sum().item())
         denom = kept_count.clamp(min=1.0)
         # Weighted average over agreeing models (normalise by sum of weights of agreeing models)
         merged[name] = agg / denom
@@ -492,16 +543,24 @@ def average_merge(
     task_vectors: Sequence[Dict[str, "torch.Tensor"]],  # type: ignore[name-defined]
     weights: Sequence[float],
 ) -> Tuple[Dict[str, "torch.Tensor"], dict]:  # type: ignore[name-defined]
-    """Plain task-vector averaging."""
+    """Plain task-vector averaging.
+
+    Walks the union of keys across all task vectors; a model missing a given
+    tensor (because its shape differs from the base) contributes nothing to
+    that tensor's merged delta.
+    """
     torch = _lazy_torch()
-    keys = task_vectors[0].keys()
     w_sum = float(sum(weights)) or 1.0
     norm_w = [w / w_sum for w in weights]
     merged_delta: Dict[str, "torch.Tensor"] = {}  # type: ignore[name-defined]
-    for name in keys:
-        agg = torch.zeros_like(task_vectors[0][name])
+    for name in _all_delta_keys(task_vectors):
+        ref = _first_with_key(task_vectors, name)
+        agg = torch.zeros_like(ref)
         for k, d in enumerate(task_vectors):
-            agg = agg + norm_w[k] * d[name]
+            t = d.get(name)
+            if t is None:
+                continue
+            agg = agg + norm_w[k] * t
         merged_delta[name] = agg
     merged_sd = {k: base_sd[k] + merged_delta.get(k, 0) for k in base_sd}
     for k in merged_sd:
@@ -605,14 +664,14 @@ def wudi_merge(
     w_sum = float(sum(weights)) or 1.0
     norm_w = [w / w_sum for w in weights]
 
-    keys = list(task_vectors[0].keys())
+    keys = _all_delta_keys(task_vectors)
     total = len(keys)
     merged_delta: Dict[str, "torch.Tensor"] = {}  # type: ignore[name-defined]
     n_linear = 0
     n_averaged = 0
 
     for i, name in enumerate(keys):
-        reference = task_vectors[0][name]
+        reference = _first_with_key(task_vectors, name)
         deltas = [tv[name] if name in tv else torch.zeros_like(reference)
                   for tv in task_vectors]
         if _is_linear_weight(name, reference):
@@ -755,13 +814,13 @@ def pcb_merge(
     w_sum = float(sum(weights)) or 1.0
     norm_w = [w / w_sum for w in weights]
 
-    keys = list(task_vectors[0].keys())
+    keys = _all_delta_keys(task_vectors)
     total = len(keys)
 
     # ---- Pass 1: score every parameter tensor ----
     scores: Dict[str, "torch.Tensor"] = {}  # type: ignore[name-defined]
     for i, name in enumerate(keys):
-        reference = task_vectors[0][name]
+        reference = _first_with_key(task_vectors, name)
         deltas = [tv[name] if name in tv else torch.zeros_like(reference)
                   for tv in task_vectors]
         scores[name] = _pcb_scores(deltas)
@@ -783,7 +842,7 @@ def pcb_merge(
     kept = 0
     scored = 0
     for i, name in enumerate(keys):
-        reference = task_vectors[0][name]
+        reference = _first_with_key(task_vectors, name)
         deltas = [tv[name] if name in tv else torch.zeros_like(reference)
                   for tv in task_vectors]
         score = scores.pop(name)
