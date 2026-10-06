@@ -3,7 +3,7 @@
     {
       "name": "Inspect CodeBERT pair",
       "kind": "inspect",
-      "description": "Compare two CodeBERT checkpoints fine-tuned on different clone-detection benchmarks.",
+      "description": "Compare two public CodeBERT variants. Shows the pairwise task-vector cosine similarity, sign-agreement, and base-architecture compatibility check.",
       "body": {
         "models": [
           "microsoft/codebert-base",
@@ -15,7 +15,7 @@
     {
       "name": "TIES merge (clone detection)",
       "kind": "merge",
-      "description": "TIES-Merging across three clone detectors. 20% trim, equal weights.",
+      "description": "TIES-Merging across three public encoders as a demo. Swap the model picks for your own fine-tunes (Library tab → Upload) to get a usable clone detector.",
       "body": {
         "models": [
           "microsoft/codebert-base",
@@ -34,11 +34,11 @@
     {
       "name": "DARE-TIES merge (vulnerability detection)",
       "kind": "merge",
-      "description": "Merge two vulnerability detectors fine-tuned on Devign and ReVeal.",
+      "description": "DARE-TIES across two public encoders as a demo. For real vulnerability detection, upload Devign/ReVeal fine-tunes (safetensors) via the Library tab and swap them in.",
       "body": {
         "models": [
-          "./checkpoints/codebert_devign",
-          "./checkpoints/codebert_reveal"
+          "microsoft/codebert-base",
+          "microsoft/graphcodebert-base"
         ],
         "base": "microsoft/codebert-base",
         "method": "dare-ties",
@@ -53,11 +53,11 @@
     {
       "name": "WUDI merge (clone detection)",
       "kind": "merge",
-      "description": "WUDI-Merging across two clone detectors. Interference-minimising per-layer optimisation, 300 steps at lr 1e-5.",
+      "description": "WUDI-Merging across two public encoders as a demo (300 steps, lr 1e-5). Interference-minimising per-layer optimisation. Upload your BCB/CLCDSA fine-tunes for a usable clone detector.",
       "body": {
         "models": [
-          "./checkpoints/codebert_bcb",
-          "./checkpoints/codebert_clcdsa"
+          "microsoft/codebert-base",
+          "microsoft/graphcodebert-base"
         ],
         "base": "microsoft/codebert-base",
         "method": "wudi",
@@ -72,12 +72,12 @@
     {
       "name": "PCB merge (clone detection)",
       "kind": "merge",
-      "description": "PCB-Merging across three clone detectors. Balances intra-task parameter significance against cross-task competition, keeping the top 10% of scores.",
+      "description": "PCB-Merging across three public encoders as a demo. Balances intra-task parameter significance against cross-task competition, keeping the top 10% of scores. Upload your own fine-tunes for a real clone detector.",
       "body": {
         "models": [
-          "./checkpoints/codebert_bcb",
-          "./checkpoints/codebert_clcdsa",
-          "./checkpoints/codebert_gptclonebench"
+          "microsoft/codebert-base",
+          "microsoft/graphcodebert-base",
+          "microsoft/unixcoder-base"
         ],
         "base": "microsoft/codebert-base",
         "method": "pcb",
@@ -91,14 +91,14 @@
       }
     },
     {
-      "name": "Cross-task merge: clone + vuln + defect",
+      "name": "Cross-task encoder merge (demo)",
       "kind": "merge",
-      "description": "Encoder-only merge across three different SE tasks \u2014 classifier heads have different shapes so only the encoder is merged; downstream re-attach a fresh head.",
+      "description": "Encoder-only DARE-TIES across three public SE encoders. Demonstrates the --encoder-only path for merging checkpoints with mismatched classifier heads; upload your task-specific fine-tunes to re-create the paper setup.",
       "body": {
         "models": [
-          "./checkpoints/codebert_bcb",
-          "./checkpoints/codebert_devign",
-          "./checkpoints/codebert_defects4j"
+          "microsoft/codebert-base",
+          "microsoft/graphcodebert-base",
+          "microsoft/unixcoder-base"
         ],
         "base": "microsoft/codebert-base",
         "method": "dare-ties",
@@ -112,7 +112,7 @@
     {
       "name": "Evaluate on BigCloneBench",
       "kind": "evaluate",
-      "description": "Evaluate a merged clone detector on a BigCloneBench test CSV.",
+      "description": "Evaluate a merged clone detector on the bundled BigCloneBench sample.",
       "body": {
         "model": "",
         "task": "clone_detection",
@@ -123,42 +123,29 @@
       }
     },
     {
-      "name": "Evaluate on Devign",
+      "name": "Evaluate on CLCDSA (cross-language)",
       "kind": "evaluate",
-      "description": "Vulnerability detection on the Devign test split.",
+      "description": "Evaluate a merged clone detector on the bundled CLCDSA cross-language sample (Java↔Python).",
       "body": {
         "model": "",
-        "task": "vulnerability_detection",
-        "batch_size": 32,
-        "max_length": 400,
-        "metric": "binary",
-        "dataset_ref": "hf-dataset://google/code_x_glue_cc_defect_detection#split=test"
-      }
-    },
-    {
-      "name": "Evaluate on Defects4J",
-      "kind": "evaluate",
-      "description": "Defect prediction on a Defects4J-derived classification CSV.",
-      "body": {
-        "model": "",
-        "task": "defect_prediction",
+        "task": "clone_detection",
         "batch_size": 32,
         "max_length": 512,
         "metric": "binary",
-        "dataset_ref": ""
+        "dataset_ref": "bundled://clcdsa"
       }
     },
     {
-      "name": "Evaluate on CommitBench (multi-class)",
+      "name": "Evaluate on GPTCloneBench",
       "kind": "evaluate",
-      "description": "Commit-message classification (fix / feat / refactor / \u2026). Macro-F1.",
+      "description": "Evaluate a merged clone detector on the bundled GPTCloneBench semantic-clone sample.",
       "body": {
         "model": "",
-        "task": "commit_classification",
+        "task": "clone_detection",
         "batch_size": 32,
-        "max_length": 256,
-        "metric": "macro",
-        "dataset_ref": ""
+        "max_length": 512,
+        "metric": "binary",
+        "dataset_ref": "bundled://gptclonebench"
       }
     }
   ]
