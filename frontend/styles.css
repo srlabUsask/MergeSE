@@ -201,6 +201,10 @@ footer {
   display: flex; flex-direction: column; gap: 6px;
   font-size: 12.5px; color: var(--muted);
 }
+/* The .grid label rule above beats the browser's default [hidden] rule on
+   specificity, so JS-toggled hidden would leave the field visible as
+   display:flex. Explicit override lets method-specific merge knobs hide. */
+.grid label[hidden] { display: none; }
 .grid label.full { grid-column: 1 / -1; }
 .grid input, .grid select, .grid textarea {
   background: rgba(0,0,0,0.25);
