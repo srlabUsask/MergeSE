@@ -1649,6 +1649,16 @@ def cmd_export(ctx: click.Context, model_path: str, fmt: str, output: str,
         tok.save_pretrained(str(out))
         size = sum(p.stat().st_size for p in out.rglob("*") if p.is_file())
     elif fmt == "onnx":
+        # torch.onnx.export requires the `onnx` Python package (optional dep).
+        # Preflight so a missing dep produces a short, actionable error instead
+        # of a 30-line traceback from deep inside torch.onnx.
+        try:
+            import onnx  # noqa: F401
+        except ImportError:
+            raise click.UsageError(
+                "ONNX export needs the 'onnx' package. Install it on the "
+                "server with `pip install onnx` (operator action), then retry."
+            )
         try:
             model = transformers.AutoModelForSequenceClassification.from_pretrained(resolved)
         except Exception:

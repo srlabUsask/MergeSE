@@ -47,6 +47,11 @@ server = [
 datasets = [
     "datasets>=2.18",
 ]
+# Needed by `mergese export --format onnx`. torch.onnx uses this at save-time
+# and raises an opaque OnnxExporterError without it.
+export = [
+    "onnx>=1.14",
+]
 dev = [
     "pytest>=8.0",
     # The server security/auth tests import the Flask app, so the dev extra
