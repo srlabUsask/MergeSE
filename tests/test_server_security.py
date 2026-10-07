@@ -408,6 +408,53 @@ def test_malformed_zip_upload_returns_400(monkeypatch, tmp_path):
     assert "malformed zip" in body.get("error", "").lower()
 
 
+def test_bad_crc_zip_upload_returns_400(monkeypatch, tmp_path):
+    """A zip with an intact central directory but corrupted member body must
+    still return 400 (not 500). The CRC failure fires during extraction, not
+    opening - the previous fix only covered the opening path."""
+    app = _load_app(monkeypatch, tmp_path)
+    # Build a legal ZIP with STORED compression, then flip a byte in the
+    # stored file data so the CRC header no longer matches the content.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("config.json", '{"model_type": "bert"}')
+    raw = bytearray(buf.getvalue())
+    # The stored file bytes begin after the local file header (30B fixed +
+    # filename). "config.json" is 11 chars, so the content starts at byte 41.
+    # Flip the first byte of the content.
+    raw[41] ^= 0xFF
+    client = app.app.test_client()
+    r = client.post(
+        "/api/uploads",
+        data={"file": (io.BytesIO(bytes(raw)), "bad-crc.zip")},
+        content_type="multipart/form-data",
+    )
+    assert r.status_code == 400, r.get_data(as_text=True)
+    body = r.get_json() or {}
+    err = body.get("error", "").lower()
+    assert "malformed zip" in err or "crc" in err, err
+
+
+def test_sse_cap_clamps_override_to_pool_size(monkeypatch, tmp_path):
+    """Setting MERGESE_MAX_SSE_STREAMS higher than the thread pool minus two
+    gets clamped so non-stream requests always have a thread. Round-two
+    retest flagged that the default used GUNICORN_THREADS instead of the
+    MERGESE_THREADS the deployment uses."""
+    app = _load_app(monkeypatch, tmp_path,
+                    MERGESE_THREADS="8",
+                    MERGESE_MAX_SSE_STREAMS="100")
+    assert app.MAX_SSE_STREAMS == 6, \
+        f"expected clamp to threads-2=6, got {app.MAX_SSE_STREAMS}"
+
+
+def test_sse_cap_default_tracks_mergese_threads(monkeypatch, tmp_path):
+    """The default cap must follow MERGESE_THREADS, not GUNICORN_THREADS,
+    because deploy/gunicorn.conf.py reads MERGESE_THREADS."""
+    app = _load_app(monkeypatch, tmp_path, MERGESE_THREADS="8")
+    assert app.MAX_SSE_STREAMS == 6, \
+        f"default should be threads-2=6, got {app.MAX_SSE_STREAMS}"
+
+
 # ---- P0-C: list/delete race ------------------------------------------------
 
 def test_list_tolerates_deleted_entries(monkeypatch, tmp_path):

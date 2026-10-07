@@ -1390,13 +1390,29 @@ def _kill_proc_group(proc: subprocess.Popen) -> None:
 # Retest finding P0-D: SSE log streams were occupying worker threads 1:1
 # with no cap, and sixteen concurrent streams against a 16-thread gthread
 # gunicorn exhausted ordinary request capacity (health probes timed out
-# with streams open). Cap concurrent streams at MAX_SSE_STREAMS so at least
-# two threads are always available for non-stream traffic; a cap hit returns
-# 429 so clients know to retry. Default headroom is `max(threads - 2, 2)`.
-_SSE_DEFAULT_CAP = max(
-    int(os.environ.get("GUNICORN_THREADS", "16")) - 2, 2
-)
-MAX_SSE_STREAMS = int(os.environ.get("MERGESE_MAX_SSE_STREAMS", str(_SSE_DEFAULT_CAP)))
+# with streams open). Cap concurrent streams so at least two threads are
+# always available for non-stream traffic; a cap hit returns 429.
+#
+# Round-two retest noted the default was reading GUNICORN_THREADS, but
+# deploy/gunicorn.conf.py actually reads MERGESE_THREADS - the two have
+# diverged and an operator who tuned MERGESE_THREADS=8 would still see a
+# cap of 14 and the full saturation bug. Match the real var, and clamp
+# any explicit override to the pool size (minus two for headroom).
+_THREADS = int(os.environ.get("MERGESE_THREADS",
+                              os.environ.get("GUNICORN_THREADS", "16")))
+_SSE_DEFAULT_CAP = max(_THREADS - 2, 2)
+_SSE_RAW = int(os.environ.get("MERGESE_MAX_SSE_STREAMS", str(_SSE_DEFAULT_CAP)))
+# Clamp operator override to leave two threads for non-stream traffic. A pool
+# with four or fewer threads gets no headroom reservation (we floor at 1); the
+# operator is on their own at that point.
+MAX_SSE_STREAMS = max(1, min(_SSE_RAW, max(_THREADS - 2, 1)))
+if _SSE_RAW != MAX_SSE_STREAMS:
+    import logging as _logging
+    _logging.getLogger("mergese").warning(
+        "MERGESE_MAX_SSE_STREAMS=%d exceeds the usable headroom for "
+        "MERGESE_THREADS=%d; clamping to %d so non-stream requests stay "
+        "serviceable.", _SSE_RAW, _THREADS, MAX_SSE_STREAMS,
+    )
 _SSE_SEM = threading.BoundedSemaphore(MAX_SSE_STREAMS)
 
 
@@ -1996,17 +2012,26 @@ def _safe_zip_extract(zf: zipfile.ZipFile, dest: Path) -> Tuple[Optional[str], L
         target.parent.mkdir(parents=True, exist_ok=True)
         # Zip-bomb guard 4: enforce the running total during the copy, so a
         # lying header cannot slip a bomb past the pre-check above.
-        with zf.open(member, "r") as src, open(target, "wb") as out:
-            while True:
-                chunk = src.read(1024 * 1024)
-                if not chunk:
-                    break
-                written += len(chunk)
-                if written > MAX_UNCOMPRESSED_BYTES:
-                    out.close()
-                    return (f"archive exceeded the {MAX_UNCOMPRESSED_BYTES}-byte "
-                            f"uncompressed limit during extraction"), extracted
-                out.write(chunk)
+        #
+        # Round-two retest finding: a bit-flip inside a stored member leaves
+        # the central directory intact (so `ZipFile(...)` succeeds) but makes
+        # the CRC check fail during `zf.open(member).read(...)`, raising
+        # BadZipFile mid-copy. Catch it here and surface as a client-side
+        # error - a corrupted upload is a user problem, not a server fault.
+        try:
+            with zf.open(member, "r") as src, open(target, "wb") as out:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_UNCOMPRESSED_BYTES:
+                        out.close()
+                        return (f"archive exceeded the {MAX_UNCOMPRESSED_BYTES}-byte "
+                                f"uncompressed limit during extraction"), extracted
+                    out.write(chunk)
+        except zipfile.BadZipFile as e:
+            return f"malformed zip member {name!r}: {e}", extracted
         extracted.append(clean)
     return None, extracted
 
@@ -2312,7 +2337,12 @@ def api_upload_dataset():
         if name.lower().endswith(".zip"):
             zip_path = d / "_upload.zip"
             f.save(str(zip_path))
-            with zipfile.ZipFile(zip_path) as zf:
+            try:
+                zf = zipfile.ZipFile(zip_path)
+            except zipfile.BadZipFile as e:
+                shutil.rmtree(d, ignore_errors=True)
+                return jsonify({"error": f"malformed zip: {e}"}), 400
+            with zf:
                 err, _ = _safe_zip_extract(zf, d)
                 if err:
                     shutil.rmtree(d, ignore_errors=True)
