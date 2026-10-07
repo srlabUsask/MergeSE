@@ -1187,6 +1187,16 @@ def cmd_merge(ctx: click.Context, models: Tuple[str, ...], base: str, method: st
             raise click.UsageError(f"--weights must be comma-separated numbers: {e}")
         if len(w) != len(models):
             raise click.UsageError(f"--weights has {len(w)} entries but {len(models)} models given.")
+        # B08: reject NaN/Inf. Without this they propagate through every
+        # weighted-sum in the merge drivers and produce a checkpoint whose
+        # tensors are all non-finite - which transformers then silently loads
+        # as a model that returns NaN logits for every input.
+        bad = [x for x in w if not math.isfinite(x)]
+        if bad:
+            raise click.UsageError(
+                f"--weights must all be finite numbers; got {bad}. "
+                "NaN or Inf weights would produce a checkpoint full of NaN tensors."
+            )
     else:
         w = [1.0] * len(models)
 
@@ -1216,20 +1226,39 @@ def cmd_merge(ctx: click.Context, models: Tuple[str, ...], base: str, method: st
             console.print(f"[yellow]warning:[/yellow] tokenizer signature mismatch for {m.path}")
 
     # ---- Decide encoder-only behaviour ----
-    head_shapes = []
+    # Collect the full set of (name, shape) pairs for every classifier-head
+    # tensor across all models. Checking only the first head tensor missed
+    # cases where RoBERTa's intermediate `classifier.dense` layer is shape-
+    # compatible across different num_labels while the output `classifier.out_proj`
+    # layer is not - the previous code mis-classified those as homogeneous.
+    head_shapes_per_model: List[Dict[str, Tuple[int, ...]]] = []
     for m in loaded:
+        shapes = {}
         for k, v in m.state_dict.items():
             if _is_classifier_head(k) and (k.endswith(".weight") or k.endswith(".bias")):
-                head_shapes.append((k, tuple(v.shape)))
-                break
-    head_shape_set = set(s for _, s in head_shapes)
-    auto_encoder_only = len(head_shape_set) > 1
+                shapes[k] = tuple(v.shape)
+        head_shapes_per_model.append(shapes)
+    all_head_keys = sorted({k for d in head_shapes_per_model for k in d})
+    auto_encoder_only = False
+    mismatches: List[str] = []
+    for key in all_head_keys:
+        shapes_for_key = {d.get(key) for d in head_shapes_per_model if key in d}
+        shapes_for_key.discard(None)
+        if len(shapes_for_key) > 1:
+            auto_encoder_only = True
+            mismatches.append(f"{key} differs across models ({sorted(shapes_for_key)})")
+        # A head tensor missing from some models but present in others is also
+        # a shape mismatch - the merge would need the base's version.
+        presence = sum(1 for d in head_shapes_per_model if key in d)
+        if 0 < presence < len(head_shapes_per_model):
+            auto_encoder_only = True
+            mismatches.append(f"{key} present in {presence}/{len(head_shapes_per_model)} models")
     if encoder_only is None:
         encoder_only = auto_encoder_only
         if auto_encoder_only:
             console.print(
                 "[yellow]heads-differ:[/yellow] models have heterogeneous classifier "
-                f"heads {sorted(head_shape_set)}; merging encoder only "
+                f"heads: {'; '.join(mismatches)}; merging encoder only "
                 "(use --include-heads to override)."
             )
     elif not encoder_only and auto_encoder_only:
@@ -1244,6 +1273,20 @@ def cmd_merge(ctx: click.Context, models: Tuple[str, ...], base: str, method: st
         _compute_task_vector(m.state_dict, base_m.state_dict, shared, encoder_only=encoder_only)
         for m in loaded
     ]
+    # B06: if every model's delta came out empty (no shape-matching keys with
+    # the base), the merge would silently return the base unchanged. That's a
+    # worse outcome than failing, because downstream the user THINKS they got
+    # a merged model. Hard-fail with an actionable message instead.
+    total_delta_keys = {k for d in deltas for k in d}
+    if not total_delta_keys:
+        raise click.UsageError(
+            "no mergeable tensors found: the base and fine-tuned models share "
+            "no shape-matching parameters. This usually means the state-dict key "
+            "prefixes differ (for example a bare BertModel base vs a "
+            "BertForSequenceClassification specialist) or every tensor was "
+            "shape-filtered. Pass the fine-tunes' underlying base checkpoint, "
+            "or re-save the models wrapped in the same architecture."
+        )
 
     # ---- Run merge ----
     t0 = time.time()
@@ -1580,6 +1623,21 @@ def _compute_metrics(y_true: Sequence[int], y_pred: Sequence[int],
     acc = sum(1 for t, p in zip(y_true, y_pred) if t == p) / len(y_true)
 
     if mode == "binary":
+        # B09: if a label or prediction isn't in {0,1} the straight-tp/fp/fn
+        # counts miss it entirely - e.g. (y_true=1, y_pred=2) wasn't counted
+        # as a false negative, so precision/recall/F1 all read 1.0 while
+        # accuracy was 0.5. Validate the domain so a misconfigured
+        # num_labels can't silently inflate the headline numbers.
+        bad_true = sorted({int(t) for t in y_true if int(t) not in (0, 1)})
+        bad_pred = sorted({int(p) for p in y_pred if int(p) not in (0, 1)})
+        if bad_true or bad_pred:
+            raise ValueError(
+                "binary metric requires labels and predictions in {0, 1}; "
+                f"got labels={bad_true or 'ok'}, predictions={bad_pred or 'ok'}. "
+                "This usually means the model's num_labels doesn't match the "
+                "task - use metric='macro' for multi-class, or evaluate against "
+                "a dataset whose labels are 0/1."
+            )
         tp = sum(1 for t, p in zip(y_true, y_pred) if t == 1 and p == 1)
         fp = sum(1 for t, p in zip(y_true, y_pred) if t == 0 and p == 1)
         fn = sum(1 for t, p in zip(y_true, y_pred) if t == 1 and p == 0)
@@ -1628,6 +1686,25 @@ def _compute_metrics(y_true: Sequence[int], y_pred: Sequence[int],
 def cmd_export(ctx: click.Context, model_path: str, fmt: str, output: str,
                max_length: int) -> None:
     """Export a merged model for deployment."""
+    # Preflight format-specific deps BEFORE loading transformers / torch, so a
+    # missing export dep gives a one-line error in <100 ms instead of waiting
+    # for a slow transformers import that would succeed but then crash deep in
+    # torch.onnx. onnxscript is checked too: torch >= 2.1 imports it from its
+    # own exporter path even when the user never references it.
+    if fmt == "onnx":
+        missing = []
+        for mod_name in ("onnx", "onnxscript"):
+            try:
+                __import__(mod_name)
+            except ImportError:
+                missing.append(mod_name)
+        if missing:
+            raise click.UsageError(
+                f"ONNX export needs the {missing} package(s). Install on the "
+                f"server with `pip install {' '.join(missing)}` (operator action), "
+                "then retry. Note: torch >= 2.1 pulls `onnxscript` from the export path "
+                "even when it isn't used explicitly."
+            )
     torch = _lazy_torch()
     transformers = _lazy_transformers()
     Console, Table, *_ = _lazy_rich()
@@ -1649,16 +1726,7 @@ def cmd_export(ctx: click.Context, model_path: str, fmt: str, output: str,
         tok.save_pretrained(str(out))
         size = sum(p.stat().st_size for p in out.rglob("*") if p.is_file())
     elif fmt == "onnx":
-        # torch.onnx.export requires the `onnx` Python package (optional dep).
-        # Preflight so a missing dep produces a short, actionable error instead
-        # of a 30-line traceback from deep inside torch.onnx.
-        try:
-            import onnx  # noqa: F401
-        except ImportError:
-            raise click.UsageError(
-                "ONNX export needs the 'onnx' package. Install it on the "
-                "server with `pip install onnx` (operator action), then retry."
-            )
+        # onnx / onnxscript availability was pre-flighted at the top.
         try:
             model = transformers.AutoModelForSequenceClassification.from_pretrained(resolved)
         except Exception:
@@ -1682,12 +1750,32 @@ def cmd_export(ctx: click.Context, model_path: str, fmt: str, output: str,
         )
         size = out.stat().st_size
     elif fmt == "torchscript":
-        try:
-            model = transformers.AutoModelForSequenceClassification.from_pretrained(
-                resolved, torchscript=True
+        # Transformers 4.x accepts a `torchscript=True` kwarg on
+        # from_pretrained that tells the model to tweak its graph for tracing.
+        # Transformers 5.x removed that argument and raises TypeError. Try the
+        # 4.x path first, fall back to loading without it, then set torchscript
+        # mode on the config directly before tracing.
+        def _load_for_trace():
+            for cls in (transformers.AutoModelForSequenceClassification, transformers.AutoModel):
+                try:
+                    try:
+                        return cls.from_pretrained(resolved, torchscript=True)
+                    except TypeError:
+                        # transformers 5.x: no torchscript kwarg
+                        m = cls.from_pretrained(resolved)
+                        if hasattr(m, "config"):
+                            try:
+                                m.config.torchscript = True
+                            except Exception:
+                                pass
+                        return m
+                except Exception:
+                    continue
+            raise click.UsageError(
+                f"could not load {resolved} as a classification or encoder model "
+                "for torchscript tracing."
             )
-        except Exception:
-            model = transformers.AutoModel.from_pretrained(resolved, torchscript=True)
+        model = _load_for_trace()
         model.eval()
         tok = transformers.AutoTokenizer.from_pretrained(resolved)
         dummy = tok("def add(a,b): return a+b", return_tensors="pt", padding="max_length",

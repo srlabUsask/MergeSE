@@ -306,3 +306,37 @@ def test_rewrite_hf_ids_to_local_paths(monkeypatch, tmp_path):
         "--trim-percentile",
         "20",
     ]
+
+
+# ---- B11: ONNX preflight now covers onnx AND onnxscript ---------------------
+
+def test_cmd_export_preflights_both_onnx_deps(monkeypatch, tmp_path):
+    """A missing `onnx` OR `onnxscript` package must raise a short Click
+    UsageError up front, not a 30-line torch traceback. Each is pre-flighted
+    independently."""
+    import click.testing
+    from mergese import cli
+    runner = click.testing.CliRunner()
+
+    # Build a stub HF dir so the resolver doesn't bail before preflight.
+    model_dir = tmp_path / "fake_model"; model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"bert"}')
+    (model_dir / "model.safetensors").write_bytes(b"\x00" * 16)
+
+    # Simulate missing onnxscript. onnx is installed in the test env; blocking
+    # its import proves the preflight catches it. Same technique for onnxscript.
+    import builtins
+    orig = builtins.__import__
+    def _block(name, *a, **kw):
+        if name == "onnxscript":
+            raise ImportError("simulated: onnxscript not installed")
+        return orig(name, *a, **kw)
+    monkeypatch.setattr(builtins, "__import__", _block)
+    r = runner.invoke(cli, [
+        "export", str(model_dir),
+        "--format", "onnx",
+        "--output", str(tmp_path / "out.onnx"),
+    ])
+    assert r.exit_code != 0
+    out = (r.output + str(r.exception)).lower()
+    assert "onnxscript" in out

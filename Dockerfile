@@ -36,5 +36,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 CMD curl 
 
 # tini reaps zombie processes from cancelled jobs
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["gunicorn", "-w", "2", "-k", "gthread", "--threads", "8", "-t", "0", \
+# Must be -w 1 (single worker): the job registry is in-process memory, so a
+# job started in worker A is a 404 from worker B. Scale with --threads instead
+# of --workers until the job state moves to shared storage.
+CMD ["gunicorn", "-w", "1", "-k", "gthread", "--threads", "16", "-t", "0", \
      "-b", "0.0.0.0:8765", "server.app:app"]
