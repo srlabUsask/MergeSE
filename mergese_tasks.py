@@ -27,7 +27,7 @@ Adding a new task is a one-liner - see the bottom of this file.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 

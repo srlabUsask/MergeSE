@@ -1,0 +1,43 @@
+version: 2
+updates:
+  # Keep the pinned GitHub Action versions in .github/workflows/ fresh.
+  # Minor + patch bumps auto-group into one PR a week to reduce PR noise;
+  # majors still arrive as their own PR so a breaking change is reviewable
+  # in isolation.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: UTC
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Python deps declared in requirements.txt + pyproject.toml. We don't pin
+  # tight versions in-tree (requirements.txt uses >= bounds), so Dependabot
+  # mostly surfaces security advisories; a weekly cadence keeps noise down.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:15"
+      timezone: UTC
+    open-pull-requests-limit: 10
+    groups:
+      pip-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Base image for the Dockerfile - a Debian/Python security advisory in the
+  # base layer is one of the most under-noticed footguns for a public demo.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:30"
+      timezone: UTC
+    open-pull-requests-limit: 3

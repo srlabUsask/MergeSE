@@ -22,7 +22,6 @@ The database path and signing secret follow the same env vars the server uses
 """
 import argparse
 import os
-import sqlite3
 import sys
 from pathlib import Path
 

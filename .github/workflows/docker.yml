@@ -1,0 +1,97 @@
+name: Docker image
+
+# The Dockerfile is a supported deploy surface (docker-compose.yml references
+# it). Build it on every PR that touches container-relevant files and boot the
+# image once to make sure gunicorn comes up and /api/health responds. Also
+# catches the "accidentally bumped workers=2 again" class of regression.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "deploy/**"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - "server/**"
+      - "frontend/**"
+      - "mergese.py"
+      - "mergese_tasks.py"
+      - ".github/workflows/docker.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-smoke:
+    name: Build image + boot + /api/health
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (local load, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: mergese:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Static CMD check (gunicorn must be -w 1)
+        # Pin: the Dockerfile is required to run gunicorn with -w 1 because
+        # the job registry is in-process memory (see B05 in the audits).
+        # If someone bumps it back to -w 2, fail here loudly.
+        run: |
+          cmd=$(docker image inspect mergese:ci --format '{{json .Config.Cmd}}')
+          echo "image CMD: $cmd"
+          if echo "$cmd" | grep -q '"-w","1"'; then
+            echo "OK: single-worker gunicorn pinned"
+          else
+            echo "::error::Dockerfile CMD must run gunicorn with -w 1; got $cmd"
+            exit 1
+          fi
+
+      - name: Boot container + probe /api/health
+        run: |
+          docker run -d --name mergese-ci --rm \
+            -p 127.0.0.1:18880:8765 \
+            -e MERGESE_REQUIRE_AUTH=0 \
+            mergese:ci
+          # tini + torch import takes a moment; retry 60 s.
+          for i in $(seq 1 60); do
+            if curl -sS http://127.0.0.1:18880/api/health >/dev/null 2>&1; then
+              echo "container up after ${i}s"; break
+            fi
+            sleep 1
+          done
+          curl -sSf http://127.0.0.1:18880/api/health
+
+      - name: Verify endpoints behave as expected inside the container
+        run: |
+          set -e
+          for path in / /app.js /api/health /api/v1/config /api/tasks /api/presets; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:18880${path}")
+            echo "  ${code}  ${path}"
+            [ "$code" = "200" ] || { echo "::error::container ${path} returned ${code}"; exit 1; }
+          done
+
+      - name: Dump container logs on any failure
+        if: failure()
+        run: docker logs mergese-ci | tail -200 || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f mergese-ci >/dev/null 2>&1 || true

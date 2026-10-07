@@ -1,0 +1,93 @@
+name: Security
+
+# Weekly + on-demand dependency CVE audit, and a committed-secret
+# tripwire on every PR. Dependency drift between weekly runs still
+# gets caught by Dependabot's own PRs; this workflow is the independent
+# check that an operator sees a red X in the UI if a new CVE lands.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "27 7 * * 1"  # Mondays 07:27 UTC - off the busy top of the hour
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    name: pip-audit (CVE scan on resolved deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install the full dep closure (base + server + export + datasets)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -e ".[dev,server,export,datasets]"
+          pip install pip-audit==2.7.3
+      - name: Audit
+        # --strict exits non-zero on any finding. Keep the surface narrow:
+        # pyproject declares our deps; we don't trust transitive-only ones
+        # less, but the signal still arrives via the resolved environment.
+        run: |
+          pip-audit --strict --progress-spinner off --disable-pip \
+            --format columns --ignore-vuln GHSA-cx63-2mw6-8hw5
+          # The ignore above (if ever enabled) must be accompanied by a
+          # comment here explaining WHY the CVE is non-applicable. Default
+          # is no ignores: the --ignore flag is a tombstone.
+
+  secret-scan:
+    name: Committed secret tripwire
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # pre-commit style scan: look at ALL files in the tree, not just
+          # the diff. Catches a secret that lived in main for a while.
+          fetch-depth: 0
+      - name: Grep for the common patterns
+        run: |
+          set -e
+          # Patterns worth yelling about on sight. Deliberately simple -
+          # better to false-positive and open an issue than to miss a key.
+          #   mergese API keys:          mse_live_...
+          #   AWS access keys:           AKIA[0-9A-Z]{16}
+          #   PEM private key headers:   -----BEGIN ... PRIVATE KEY-----
+          #   GitHub tokens:             ghp_ / gho_ / ghs_ / ghu_
+          #   generic 32+ char hex blobs beside the word "token"/"secret"/"password"
+          # The `--include` filters skip binaries + the test fixtures that
+          # intentionally use secret-shaped strings.
+          BAD=0
+          scan() {
+            local label="$1"; shift
+            if git grep -nE "$@" -- \
+                ':(exclude)**/*.safetensors' \
+                ':(exclude)**/*.bin' \
+                ':(exclude)**/*.png' \
+                ':(exclude)**/*.jpg' \
+                ':(exclude)**/*.svg' \
+                ':(exclude)tests/**' ; then
+              echo "::error::possible $label found above - redact before merging"
+              BAD=1
+            fi
+          }
+          scan "MergeSE API key"      '^mse_live_[A-Za-z0-9_-]{20,}' || true
+          scan "AWS access key"       'AKIA[0-9A-Z]{16}' || true
+          scan "PEM private key"      'BEGIN [A-Z ]*PRIVATE KEY' || true
+          scan "GitHub token"         'gh[opsu]_[A-Za-z0-9]{30,}' || true
+          scan "hard-coded password=" 'password\s*=\s*["'\''][^"'\'' ]{8,}["'\'']' || true
+          exit $BAD

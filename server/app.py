@@ -40,7 +40,6 @@ Model references in API calls can be one of:
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import re

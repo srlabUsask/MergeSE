@@ -1,0 +1,17 @@
+# CODEOWNERS — anyone opening a PR that touches these paths will have the
+# listed owners auto-requested as reviewers. Also gates "require review from
+# code owners" branch protection when that setting is enabled on main.
+
+# Default owner: Palash (project lead)
+*                                   @Roy101
+
+# Server, security-sensitive paths — second pair of eyes required.
+/server/                            @Roy101
+/mergese.py                         @Roy101
+/.github/workflows/                 @Roy101
+/deploy/                            @Roy101
+/Dockerfile                         @Roy101
+/docker-compose.yml                 @Roy101
+
+# Preset catalogue drives the public UI; swapping a preset ref ships to prod.
+/server/presets.json                @Roy101
