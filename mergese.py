@@ -1267,25 +1267,56 @@ def cmd_merge(ctx: click.Context, models: Tuple[str, ...], base: str, method: st
             "shape; non-matching head tensors will still be skipped per-tensor."
         )
 
+    # ---- Normalise wrapper prefixes ---------------------------------------
+    # A very common input combination is a bare encoder base (e.g. BertModel,
+    # keys like `encoder.layer...`) merged with task-specific fine-tunes loaded
+    # as BertForSequenceClassification (keys like `bert.encoder.layer...` plus
+    # `classifier.*`). The shared-key intersection is empty on raw inputs even
+    # though every encoder tensor really does line up after stripping one
+    # dot-delimited component from the specialist. Do that strip automatically
+    # per model, print a line so the user sees it happen, and only then
+    # compute the shared-key intersection. Specialists that were already
+    # prefix-aligned with the base are left untouched.
+    base_keys = set(base_m.state_dict.keys())
+    for m in loaded:
+        m_keys = set(m.state_dict.keys())
+        if m_keys & base_keys:
+            continue  # already aligned
+        # Candidate wrapper prefixes: the first component of each key.
+        prefixes = {k.split(".", 1)[0] + "." for k in m_keys if "." in k}
+        best = None
+        for pfx in prefixes:
+            stripped = {k[len(pfx):] for k in m_keys if k.startswith(pfx)}
+            overlap = len(stripped & base_keys)
+            if overlap and (best is None or overlap > best[1]):
+                best = (pfx, overlap)
+        if best is not None:
+            pfx = best[0]
+            m.state_dict = {
+                (k[len(pfx):] if k.startswith(pfx) else k): v
+                for k, v in m.state_dict.items()
+            }
+            console.print(
+                f"[cyan]prefix-align:[/cyan] stripped {pfx!r} from {m.path} "
+                f"(matches base on {best[1]} tensors)."
+            )
+
     # ---- Compute task vectors over shared keys ----
     shared = _shared_keys([base_m, *loaded])
     deltas = [
         _compute_task_vector(m.state_dict, base_m.state_dict, shared, encoder_only=encoder_only)
         for m in loaded
     ]
-    # B06: if every model's delta came out empty (no shape-matching keys with
-    # the base), the merge would silently return the base unchanged. That's a
-    # worse outcome than failing, because downstream the user THINKS they got
-    # a merged model. Hard-fail with an actionable message instead.
+    # B06: if every model's delta is STILL empty after prefix normalisation,
+    # the inputs really are incompatible. Hard-fail rather than silently
+    # returning the base unchanged - the user needs to pick different inputs.
     total_delta_keys = {k for d in deltas for k in d}
     if not total_delta_keys:
         raise click.UsageError(
-            "no mergeable tensors found: the base and fine-tuned models share "
-            "no shape-matching parameters. This usually means the state-dict key "
-            "prefixes differ (for example a bare BertModel base vs a "
-            "BertForSequenceClassification specialist) or every tensor was "
-            "shape-filtered. Pass the fine-tunes' underlying base checkpoint, "
-            "or re-save the models wrapped in the same architecture."
+            "no mergeable tensors found: after attempting to align state-dict "
+            "key prefixes, the base and fine-tuned models still share no "
+            "shape-matching parameters. Pass the fine-tunes' underlying base "
+            "checkpoint, or re-save the models wrapped in the same architecture."
         )
 
     # ---- Run merge ----

@@ -1,83 +1,124 @@
 {
+  "_comment": "Presets referencing server:// use operator-mounted fine-tunes from MERGESE_CHECKPOINTS; the clone-detection models are task-specific CodeBERT/GraphCodeBERT/UniXcoder fine-tunes with real validation F1s in the 0.89-0.99 range (see each checkpoint's best_metrics.json).",
   "presets": [
     {
-      "name": "Inspect CodeBERT pair",
+      "name": "Inspect CodeBERT fine-tunes (BCB vs CLCDSA)",
       "kind": "inspect",
-      "description": "Compare two public CodeBERT variants. Shows the pairwise task-vector cosine similarity, sign-agreement, and base-architecture compatibility check.",
+      "description": "Compare the task-vector geometry of two CodeBERT clone-detection fine-tunes trained on BigCloneBench vs CLCDSA. Shows pairwise cosine similarity + sign-agreement + architecture compatibility.",
       "body": {
         "models": [
-          "microsoft/codebert-base",
-          "microsoft/graphcodebert-base"
+          "server://codebert_bcb",
+          "server://codebert_clcdsa"
         ],
         "base": "microsoft/codebert-base"
       }
     },
+
     {
-      "name": "TIES merge (clone detection)",
+      "name": "Evaluate CodeBERT-BCB on BigCloneBench (expect F1 ~0.90)",
+      "kind": "evaluate",
+      "description": "Direct evaluation of the pretrained CodeBERT fine-tune on bundled BigCloneBench (200 rows). Reproduces the ~0.90 F1 reported in best_metrics.json. No merging needed.",
+      "body": {
+        "model": "server://codebert_bcb",
+        "task": "clone_detection",
+        "batch_size": 32,
+        "max_length": 512,
+        "metric": "binary",
+        "dataset_ref": "bundled://bigclonebench"
+      }
+    },
+    {
+      "name": "Evaluate UniXcoder-CLCDSA on CLCDSA (expect F1 ~0.94)",
+      "kind": "evaluate",
+      "description": "Direct evaluation of the pretrained UniXcoder fine-tune on bundled CLCDSA (cross-language, 200 rows). Reproduces the ~0.94 F1 reported in best_metrics.json.",
+      "body": {
+        "model": "server://unixcoder_clcdsa",
+        "task": "clone_detection",
+        "batch_size": 32,
+        "max_length": 512,
+        "metric": "binary",
+        "dataset_ref": "bundled://clcdsa"
+      }
+    },
+    {
+      "name": "Evaluate UniXcoder-BCB on GPTCloneBench (OOD)",
+      "kind": "evaluate",
+      "description": "Out-of-distribution evaluation: UniXcoder fine-tuned on BigCloneBench, tested on GPT-generated semantic clones.",
+      "body": {
+        "model": "server://unixcoder_bcb",
+        "task": "clone_detection",
+        "batch_size": 32,
+        "max_length": 512,
+        "metric": "binary",
+        "dataset_ref": "bundled://gptclonebench"
+      }
+    },
+
+    {
+      "name": "TIES merge: CodeBERT (BCB) + CodeBERT (CLCDSA)",
       "kind": "merge",
-      "description": "TIES-Merging across three public encoders as a demo. Swap the model picks for your own fine-tunes (Library tab → Upload) to get a usable clone detector.",
+      "description": "TIES-Merging across two CodeBERT clone-detection fine-tunes trained on different benchmarks. The merged encoder should carry signal from both.",
       "body": {
         "models": [
-          "microsoft/codebert-base",
-          "microsoft/graphcodebert-base",
-          "microsoft/unixcoder-base"
+          "server://codebert_bcb",
+          "server://codebert_clcdsa"
         ],
         "base": "microsoft/codebert-base",
         "method": "ties",
         "trim_percentile": 20,
-        "drop_rate": 0.3,
         "seed": 42,
         "task": "clone_detection",
         "encoder_only": false
       }
     },
     {
-      "name": "DARE-TIES merge (vulnerability detection)",
+      "name": "DARE-TIES merge: UniXcoder (BCB) + UniXcoder (CLCDSA)",
       "kind": "merge",
-      "description": "DARE-TIES across two public encoders as a demo. For real vulnerability detection, upload Devign/ReVeal fine-tunes (safetensors) via the Library tab and swap them in.",
+      "description": "DARE-TIES across two UniXcoder clone-detection fine-tunes. Drops 30% of task-vector entries before TIES to reduce interference.",
       "body": {
         "models": [
-          "microsoft/codebert-base",
-          "microsoft/graphcodebert-base"
+          "server://unixcoder_bcb",
+          "server://unixcoder_clcdsa"
         ],
-        "base": "microsoft/codebert-base",
+        "base": "microsoft/unixcoder-base",
         "method": "dare-ties",
         "trim_percentile": 20,
         "drop_rate": 0.3,
         "weights": "1,1",
         "seed": 42,
-        "task": "vulnerability_detection",
+        "task": "clone_detection",
         "encoder_only": false
       }
     },
     {
-      "name": "WUDI merge (clone detection)",
+      "name": "WUDI merge: UniXcoder BCB + CLCDSA + crosslang",
       "kind": "merge",
-      "description": "WUDI-Merging across two public encoders as a demo (300 steps, lr 1e-5). Interference-minimising per-layer optimisation. Upload your BCB/CLCDSA fine-tunes for a usable clone detector.",
+      "description": "WUDI-Merging across three UniXcoder clone-detection fine-tunes. 300 interference-minimising optimisation steps per linear layer at lr 1e-5.",
       "body": {
         "models": [
-          "microsoft/codebert-base",
-          "microsoft/graphcodebert-base"
+          "server://unixcoder_bcb",
+          "server://unixcoder_clcdsa",
+          "server://unixcoder_crosslang"
         ],
-        "base": "microsoft/codebert-base",
+        "base": "microsoft/unixcoder-base",
         "method": "wudi",
         "wudi_steps": 300,
         "wudi_lr": 0.00001,
-        "weights": "1,1",
+        "weights": "1,1,1",
         "seed": 42,
         "task": "clone_detection",
         "encoder_only": false
       }
     },
     {
-      "name": "PCB merge (clone detection)",
+      "name": "PCB merge: cross-base clone detectors (CodeBERT + GraphCodeBERT + UniXcoder on BCB)",
       "kind": "merge",
-      "description": "PCB-Merging across three public encoders as a demo. Balances intra-task parameter significance against cross-task competition, keeping the top 10% of scores. Upload your own fine-tunes for a real clone detector.",
+      "description": "PCB-Merging across three RoBERTa-family clone detectors fine-tuned on BigCloneBench. Keeps the top 10% of competition scores globally; ideal for merging different backbones that saw the same task.",
       "body": {
         "models": [
-          "microsoft/codebert-base",
-          "microsoft/graphcodebert-base",
-          "microsoft/unixcoder-base"
+          "server://codebert_bcb",
+          "server://graphcodebert_bcb",
+          "server://unixcoder_bcb"
         ],
         "base": "microsoft/codebert-base",
         "method": "pcb",
@@ -91,9 +132,9 @@
       }
     },
     {
-      "name": "Cross-task encoder merge (demo)",
+      "name": "Cross-task encoder merge (demo: public encoders)",
       "kind": "merge",
-      "description": "Encoder-only DARE-TIES across three public SE encoders. Demonstrates the --encoder-only path for merging checkpoints with mismatched classifier heads; upload your task-specific fine-tunes to re-create the paper setup.",
+      "description": "Encoder-only DARE-TIES across three public SE encoders. Demonstrates the --encoder-only path for merging checkpoints with mismatched classifier heads; the base's head is preserved so you can attach a fresh task-specific head downstream.",
       "body": {
         "models": [
           "microsoft/codebert-base",
@@ -107,45 +148,6 @@
         "weights": "1,1,1",
         "seed": 42,
         "encoder_only": true
-      }
-    },
-    {
-      "name": "Evaluate on BigCloneBench",
-      "kind": "evaluate",
-      "description": "Evaluate a merged clone detector on the bundled BigCloneBench sample.",
-      "body": {
-        "model": "",
-        "task": "clone_detection",
-        "batch_size": 32,
-        "max_length": 512,
-        "metric": "binary",
-        "dataset_ref": "bundled://bigclonebench"
-      }
-    },
-    {
-      "name": "Evaluate on CLCDSA (cross-language)",
-      "kind": "evaluate",
-      "description": "Evaluate a merged clone detector on the bundled CLCDSA cross-language sample (Java↔Python).",
-      "body": {
-        "model": "",
-        "task": "clone_detection",
-        "batch_size": 32,
-        "max_length": 512,
-        "metric": "binary",
-        "dataset_ref": "bundled://clcdsa"
-      }
-    },
-    {
-      "name": "Evaluate on GPTCloneBench",
-      "kind": "evaluate",
-      "description": "Evaluate a merged clone detector on the bundled GPTCloneBench semantic-clone sample.",
-      "body": {
-        "model": "",
-        "task": "clone_detection",
-        "batch_size": 32,
-        "max_length": 512,
-        "metric": "binary",
-        "dataset_ref": "bundled://gptclonebench"
       }
     }
   ]

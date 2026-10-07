@@ -382,3 +382,45 @@ def test_cmd_merge_rejects_nan_weights():
         "--output", "/tmp/mergese_test_out_should_not_exist",
     ])
     assert r2.exit_code != 0
+
+
+def test_merge_prefix_aligns_wrapped_specialists():
+    """A bare encoder base + wrapped `AutoModelForSequenceClassification`
+    specialists is a legit input combo that previously triggered B06's hard
+    fail. The prefix-align step strips the wrapper (`bert.`, `roberta.`, ...)
+    so the encoder tensors line up with the base and the merge produces real
+    deltas.
+
+    Simulates what cmd_merge does to the LoadedModel.state_dict objects
+    before computing shared keys.
+    """
+    import torch
+    base_sd = {
+        "embeddings.weight": torch.zeros(4),
+        "encoder.layer.0.weight": torch.zeros(4),
+    }
+    # Wrapped specialist: encoder tensors have a `bert.` prefix + extra head
+    spec_sd = {
+        "bert.embeddings.weight": torch.ones(4) * 0.1,
+        "bert.encoder.layer.0.weight": torch.ones(4) * 0.1,
+        "classifier.weight": torch.ones((2, 4)),  # head, no base match
+    }
+    # Reproduce the align logic from cmd_merge.
+    base_keys = set(base_sd)
+    m_keys = set(spec_sd)
+    assert not (m_keys & base_keys), "test setup: specialist must have no raw overlap"
+    prefixes = {k.split(".", 1)[0] + "." for k in m_keys if "." in k}
+    best = None
+    for pfx in prefixes:
+        stripped = {k[len(pfx):] for k in m_keys if k.startswith(pfx)}
+        overlap = len(stripped & base_keys)
+        if overlap and (best is None or overlap > best[1]):
+            best = (pfx, overlap)
+    assert best is not None, "align should find a candidate"
+    assert best[0] == "bert.", f"expected 'bert.' prefix, got {best[0]!r}"
+    assert best[1] == 2, f"expected overlap=2, got {best[1]}"
+    pfx = best[0]
+    aligned = {(k[len(pfx):] if k.startswith(pfx) else k): v for k, v in spec_sd.items()}
+    # After alignment, encoder keys match the base's; classifier survives as-is.
+    assert set(aligned) == {"embeddings.weight", "encoder.layer.0.weight", "classifier.weight"}
+    assert set(aligned) & base_keys == {"embeddings.weight", "encoder.layer.0.weight"}
