@@ -389,3 +389,118 @@ def test_cors_accepts_official_origin(monkeypatch, tmp_path):
     client = app.app.test_client()
     r = client.get("/api/health", headers={"Origin": "https://mergese.usask.ca"})
     assert r.headers.get("Access-Control-Allow-Origin") == "https://mergese.usask.ca"
+
+
+# ---- P0-B: malformed zip -> 400, not 500 ------------------------------------
+
+def test_malformed_zip_upload_returns_400(monkeypatch, tmp_path):
+    """A client posting non-zip bytes under 'file' used to return 500; now 400."""
+    app = _load_app(monkeypatch, tmp_path)  # auth disabled: single-tenant mode
+    client = app.app.test_client()
+    # 'this is not a zip' - no PK\x03\x04 magic
+    r = client.post(
+        "/api/uploads",
+        data={"file": (io.BytesIO(b"not a zip at all"), "broken.zip")},
+        content_type="multipart/form-data",
+    )
+    assert r.status_code == 400, r.get_data(as_text=True)
+    body = r.get_json() or {}
+    assert "malformed zip" in body.get("error", "").lower()
+
+
+# ---- P0-C: list/delete race ------------------------------------------------
+
+def test_list_tolerates_deleted_entries(monkeypatch, tmp_path):
+    """Simulate a child dir disappearing between iterdir() and stat().
+
+    We can't easily inject a race from pytest, but the helpers used by the
+    listing endpoints must themselves tolerate FileNotFoundError. We call
+    them directly on a root containing a dir that we rmdir() mid-iteration.
+    """
+    app = _load_app(monkeypatch, tmp_path)
+    import shutil
+    # _load_app seeds MERGESE_UPLOADS at tmp_path/uploads, so use a sibling.
+    root = tmp_path / "race_scratch"
+    root.mkdir()
+    (root / "a").mkdir()
+    (root / "b").mkdir()
+    (root / "a" / "data.txt").write_text("x")
+    (root / "b" / "data.txt").write_text("y")
+
+    # Baseline: both appear.
+    entries = app._safe_sorted_by_mtime(root)
+    assert len(entries) == 2
+
+    # Delete one, call again - no exception.
+    shutil.rmtree(root / "a")
+    entries = app._safe_sorted_by_mtime(root)
+    assert len(entries) == 1
+
+    # Delete the root itself (extreme case). Returns [].
+    shutil.rmtree(root)
+    assert app._safe_sorted_by_mtime(root) == []
+
+
+# ---- P0-D: SSE semaphore caps concurrent streams ---------------------------
+
+def test_sse_stream_cap_rejects_overflow_with_429(monkeypatch, tmp_path):
+    """When the SSE semaphore is exhausted, further /stream requests get 429."""
+    # Set a tiny cap so we can exhaust it synchronously.
+    app = _load_app(monkeypatch, tmp_path, MERGESE_REQUIRE_AUTH="0",
+                    MERGESE_MAX_SSE_STREAMS="1")
+
+    # Seed JOBS with a fake running job that has a log file.
+    log = tmp_path / "job.log"
+    log.write_text("hello\n")
+    jid = "deadbeef1234"
+
+    class _StubJob:
+        id = jid
+        kind = "merge"
+        status = "running"
+        exit_code = None
+        log_path = log
+        owner = None
+
+    with app.JOBS_LOCK:
+        app.JOBS[jid] = _StubJob()
+
+    # Take the single slot without consuming the generator.
+    assert app._SSE_SEM.acquire(blocking=False)
+
+    try:
+        client = app.app.test_client()
+        r = client.get(f"/api/jobs/{jid}/stream")
+        assert r.status_code == 429, r.get_data(as_text=True)
+        body = r.get_json() or {}
+        assert "too many open log streams" in body.get("error", "")
+    finally:
+        app._SSE_SEM.release()
+
+
+# ---- P0-A: download refused for pending jobs -------------------------------
+
+def test_download_refused_when_job_not_done(monkeypatch, tmp_path):
+    """A download request for a non-completed job must return 409, not stream
+    an empty zip that gets cached."""
+    app = _load_app(monkeypatch, tmp_path, MERGESE_REQUIRE_AUTH="0")
+
+    jid = "f00dbabe4321"
+
+    class _StubJob:
+        id = jid
+        kind = "merge"
+        status = "running"
+        exit_code = None
+        finished_at = None
+        log_path = tmp_path / "no.log"
+        owner = None
+
+    with app.JOBS_LOCK:
+        app.JOBS[jid] = _StubJob()
+
+    client = app.app.test_client()
+    r = client.get(f"/api/jobs/{jid}/download")
+    assert r.status_code == 409, r.get_data(as_text=True)
+    body = r.get_json() or {}
+    assert "only available for completed jobs" in body.get("error", "")
