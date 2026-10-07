@@ -75,8 +75,13 @@ function renderTurnstile() {
   const doRender = () => {
     if (!window.turnstile) { setTimeout(doRender, 250); return; }
     if (AUTH.widgetId !== null) { try { window.turnstile.reset(AUTH.widgetId); } catch (_) {} return; }
+    // Pick a widget size that fits the container. The default (300x65) over-
+    // flows an auth card on a 320px phone; "flexible" expands/contracts to
+    // the parent's width so narrow devices stay fully inside the card.
+    const compact = window.matchMedia && window.matchMedia("(max-width: 420px)").matches;
     AUTH.widgetId = window.turnstile.render("#turnstileBox", {
       sitekey: AUTH.siteKey,
+      size: compact ? "flexible" : "normal",
       callback: (tok) => exchangeAnon(tok),
       "error-callback": () => { $("#authGateMsg").textContent = "Challenge failed - try again."; },
       "expired-callback": () => { try { window.turnstile.reset(AUTH.widgetId); } catch (_) {} },
