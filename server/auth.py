@@ -161,17 +161,23 @@ class AuthStore:
             return cur.rowcount > 0
 
     def _client_from_key(self, plaintext: str) -> Client:
-        row = self._conn.execute(
-            "SELECT * FROM api_clients WHERE key_hash=?",
-            (hash_key(plaintext),)).fetchone()
-        if row is None:
-            raise AuthError(401, "invalid API key")
-        if row["disabled"]:
-            raise AuthError(403, "API key has been revoked")
-        with self._lock, self._conn:
-            self._conn.execute(
-                "UPDATE api_clients SET last_used_at=? WHERE client_id=?",
-                (_now(), row["client_id"]))
+        # ALL use of self._conn must hold self._lock. The sqlite3 connection
+        # is check_same_thread=False and shared across gunicorn threads;
+        # concurrent uses without the lock surface as sqlite3.InterfaceError
+        # ("bad parameter"), OperationalError ("database is locked"), and
+        # intermittent 401 "invalid API key" on perfectly valid keys.
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM api_clients WHERE key_hash=?",
+                (hash_key(plaintext),)).fetchone()
+            if row is None:
+                raise AuthError(401, "invalid API key")
+            if row["disabled"]:
+                raise AuthError(403, "API key has been revoked")
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE api_clients SET last_used_at=? WHERE client_id=?",
+                    (_now(), row["client_id"]))
         tier = TIERS.get(row["tier"], TIERS["key"])
         limit = row["daily_limit"] if row["daily_limit"] is not None else tier.daily_jobs
         return Client(row["client_id"], "key", tier, int(limit))
@@ -232,6 +238,11 @@ class AuthStore:
     # ---- quota ledger -------------------------------------------------------
 
     def _jobs_used_today(self, client_id: str) -> int:
+        # Caller MAY already hold self._lock (e.g. check_and_reserve does).
+        # Use a reentrant pattern: we don't take the lock here, we rely on
+        # the caller. All public callers below acquire the lock before
+        # reaching this method. If a new caller is added that doesn't,
+        # that caller must take self._lock first.
         row = self._conn.execute(
             "SELECT jobs_used FROM usage_ledger WHERE client_id=? AND day=?",
             (client_id, _day_stamp())).fetchone()
@@ -255,6 +266,16 @@ class AuthStore:
             self._conn.execute(
                 "INSERT INTO usage_ledger (client_id, day, jobs_used) VALUES (?,?,1) "
                 "ON CONFLICT(client_id, day) DO UPDATE SET jobs_used = jobs_used + 1",
+                (client.client_id, _day_stamp()))
+
+    def release_reservation(self, client: Client) -> None:
+        """Give back one slot of today's budget. Called when an admitted job
+        is rejected downstream (e.g. per-user active-slot check fires AFTER
+        the daily-quota reservation). Idempotent: never drops below zero."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE usage_ledger SET jobs_used = max(0, jobs_used - 1) "
+                "WHERE client_id=? AND day=?",
                 (client.client_id, _day_stamp()))
 
     def usage(self, client: Client) -> Dict[str, object]:
