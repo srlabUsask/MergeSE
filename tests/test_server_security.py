@@ -340,3 +340,52 @@ def test_cmd_export_preflights_both_onnx_deps(monkeypatch, tmp_path):
     assert r.exit_code != 0
     out = (r.output + str(r.exception)).lower()
     assert "onnxscript" in out
+
+
+# ---- B6: job endpoints must auth BEFORE JOBS.get() --------------------------
+#
+# Stress testing showed an unauthenticated caller could tell existing from
+# nonexistent job IDs by the 401-vs-404 split. The handler now authenticates
+# first, so both unauth probes return 401 regardless of id existence.
+
+@pytest.mark.parametrize("suffix", ["", "/log", "/result", "/stream", "/download"])
+def test_job_endpoints_401_without_auth_regardless_of_id(monkeypatch, tmp_path, suffix):
+    app = _load_app(monkeypatch, tmp_path, MERGESE_REQUIRE_AUTH="1",
+                    MERGESE_ADMIN_TOKEN="t")
+    client = app.app.test_client()
+    r_missing  = client.get(f"/api/jobs/does-not-exist{suffix}")
+    r_random   = client.get(f"/api/jobs/{'f' * 12}{suffix}")
+    # Both must be 401 (not a 404-vs-401 oracle). We don't assert the body
+    # text so the test survives Flask's abort(401) default page just as well
+    # as the Flask-CORS wrapped version.
+    assert r_missing.status_code == 401, r_missing.get_data(as_text=True)
+    assert r_random.status_code  == 401, r_random.get_data(as_text=True)
+
+
+def test_job_cancel_401_without_auth(monkeypatch, tmp_path):
+    app = _load_app(monkeypatch, tmp_path, MERGESE_REQUIRE_AUTH="1",
+                    MERGESE_ADMIN_TOKEN="t")
+    client = app.app.test_client()
+    r = client.post("/api/jobs/does-not-exist/cancel")
+    assert r.status_code == 401, r.get_data(as_text=True)
+
+
+# ---- B5: CORS whitelist (no Origin reflection) ------------------------------
+
+def test_cors_rejects_unknown_origin(monkeypatch, tmp_path):
+    app = _load_app(monkeypatch, tmp_path, MERGESE_REQUIRE_AUTH="1",
+                    MERGESE_ADMIN_TOKEN="t")
+    client = app.app.test_client()
+    r = client.get("/api/health", headers={"Origin": "https://evil.example"})
+    # Flask-CORS omits Access-Control-Allow-Origin when the origin isn't on
+    # the whitelist. The one case it DOES set it to is the allowed origin.
+    assert r.headers.get("Access-Control-Allow-Origin") in (None, "https://mergese.usask.ca"), \
+        f"CORS reflected an unlisted origin: {r.headers.get('Access-Control-Allow-Origin')}"
+
+
+def test_cors_accepts_official_origin(monkeypatch, tmp_path):
+    app = _load_app(monkeypatch, tmp_path, MERGESE_REQUIRE_AUTH="1",
+                    MERGESE_ADMIN_TOKEN="t")
+    client = app.app.test_client()
+    r = client.get("/api/health", headers={"Origin": "https://mergese.usask.ca"})
+    assert r.headers.get("Access-Control-Allow-Origin") == "https://mergese.usask.ca"

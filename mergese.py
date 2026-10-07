@@ -1009,6 +1009,28 @@ def architecture_greedy_merge(
     return merged_sd, stats
 
 
+def _normalize_layernorm_keys(sd):
+    """Translate TF-era ``LayerNorm.gamma``/``LayerNorm.beta`` keys to the
+    modern PyTorch names ``LayerNorm.weight``/``LayerNorm.bias``.
+
+    Server-mounted fine-tunes trained with older HuggingFace Transformers
+    (<= 4.0) saved the LayerNorm params under the Keras-style gamma/beta
+    names. ``AutoModel.from_pretrained`` silently remaps those at load, but
+    the strict=True ``load_state_dict`` path used by the architecture-greedy
+    eval does not - without this translation the eval fails with 'Missing
+    key(s)' for every LayerNorm in the model (B1 from the stress test).
+    Returns the same dict object when nothing matches, so the common case
+    stays zero-copy.
+    """
+    if not any(k.endswith(".gamma") or k.endswith(".beta") for k in sd):
+        return sd
+    return {
+        (k[: -len(".gamma")] + ".weight" if k.endswith(".gamma") else
+         k[: -len(".beta")]  + ".bias"   if k.endswith(".beta")  else k): v
+        for k, v in sd.items()
+    }
+
+
 def _build_architecture_eval_fn(
     base_path: str,
     resolved_eval_csv: str,
@@ -1155,6 +1177,7 @@ def _build_architecture_eval_fn(
     dropout.eval()
 
     def eval_fn(state_dict) -> float:
+        state_dict = _normalize_layernorm_keys(state_dict)
         with torch.no_grad():
             if full_shell is not None:
                 # Wrapped classification shell: load into the full model and

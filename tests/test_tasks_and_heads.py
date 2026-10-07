@@ -166,3 +166,49 @@ def test_metrics_auto_picks_binary_for_01():
 def test_metrics_auto_picks_macro_for_multiclass():
     m = _compute_metrics([0, 1, 2, 0], [0, 2, 1, 0], mode="auto")
     assert m["mode"] == "macro"
+
+
+# ---------------------------------------------------------------------------
+# B1: architecture-greedy eval must tolerate TF-era LayerNorm key names
+# ---------------------------------------------------------------------------
+#
+# Stress testing against the deployed service showed `architecture_greedy_merge`
+# failing on bundled fine-tunes trained with older HuggingFace Transformers:
+# those checkpoints save LayerNorm params under `LayerNorm.gamma`/`.beta`
+# while modern Transformers names them `LayerNorm.weight`/`.bias`. The
+# strict=True load_state_dict path blew up with a Missing-keys error. We now
+# remap the keys inside eval_fn before the load; this test pins that remap.
+
+def test_layernorm_key_remap_translates_gamma_beta():
+    """Verify the normalisation path renames all gamma/beta LayerNorm keys."""
+    from mergese import _normalize_layernorm_keys
+    old_sd = {
+        "embeddings.LayerNorm.gamma": torch.ones(4),
+        "embeddings.LayerNorm.beta": torch.zeros(4),
+        "encoder.layer.0.attention.output.LayerNorm.gamma": torch.ones(4),
+        "encoder.layer.0.attention.output.LayerNorm.beta": torch.zeros(4),
+        "encoder.layer.0.output.LayerNorm.gamma": torch.ones(4),
+        "encoder.layer.0.output.LayerNorm.beta": torch.zeros(4),
+        # Non-LayerNorm key: must pass through untouched.
+        "encoder.layer.0.attention.self.query.weight": torch.randn(4, 4),
+    }
+    renamed = _normalize_layernorm_keys(old_sd)
+    assert "embeddings.LayerNorm.weight" in renamed
+    assert "embeddings.LayerNorm.bias" in renamed
+    assert "encoder.layer.0.attention.output.LayerNorm.weight" in renamed
+    assert "encoder.layer.0.attention.output.LayerNorm.bias" in renamed
+    assert "encoder.layer.0.output.LayerNorm.weight" in renamed
+    assert "encoder.layer.0.output.LayerNorm.bias" in renamed
+    assert "encoder.layer.0.attention.self.query.weight" in renamed
+    assert not any(k.endswith(".gamma") or k.endswith(".beta") for k in renamed)
+
+
+def test_layernorm_key_remap_is_a_noop_for_modern_checkpoint():
+    """A modern state_dict must pass through unchanged - same object, zero copy."""
+    from mergese import _normalize_layernorm_keys
+    modern_sd = {
+        "embeddings.LayerNorm.weight": torch.ones(4),
+        "embeddings.LayerNorm.bias": torch.zeros(4),
+    }
+    out = _normalize_layernorm_keys(modern_sd)
+    assert out is modern_sd, "no-op must return the same dict object"

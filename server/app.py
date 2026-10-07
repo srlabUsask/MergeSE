@@ -1392,7 +1392,18 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 # Don't 405/redirect on a trailing slash - visitors curl with and without,
 # and Flask's default sends POST/PUT/DELETE to a 405 for the slash variant.
 app.url_map.strict_slashes = False
-CORS(app)
+# CORS: only answer the official frontend origin + localhost (for dev). The
+# earlier `CORS(app)` reflected any Origin header back as
+# `Access-Control-Allow-Origin`, which stress testing flagged (B5): a malicious
+# page could trigger CORS-enabled XHR against our API on behalf of a visitor.
+# Credentials are not shared cross-origin here (auth is bearer-token, not
+# cookie), so the practical risk is small, but reflecting unknown origins is
+# a hygiene issue in a public service. MERGESE_CORS_ORIGINS lets an operator
+# add further hostnames (comma-separated) without a redeploy.
+_default_origins = ["https://mergese.usask.ca",
+                    "http://localhost:5173", "http://127.0.0.1:5173"]
+_env_origins = [o.strip() for o in os.environ.get("MERGESE_CORS_ORIGINS", "").split(",") if o.strip()]
+CORS(app, resources={r"/api/*": {"origins": _default_origins + _env_origins}})
 
 
 # ---- security response headers ----------------------------------------------
@@ -1676,6 +1687,11 @@ def api_jobs():
 
 @app.route("/api/jobs/<job_id>")
 def api_job(job_id: str):
+    # Authenticate before the dict lookup: otherwise an unauth caller gets
+    # 404 for a nonexistent id and 401 for an existing one, which leaks job
+    # existence (B6 from the stress test). Job IDs are 48 bits of random
+    # hex so the practical risk is tiny, but defense-in-depth is cheap here.
+    _authenticate()
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     if not job:
@@ -1686,6 +1702,7 @@ def api_job(job_id: str):
 
 @app.route("/api/jobs/<job_id>/stream")
 def api_job_stream(job_id: str):
+    _authenticate()
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     if not job:
@@ -1698,6 +1715,7 @@ def api_job_stream(job_id: str):
 
 @app.route("/api/jobs/<job_id>/result")
 def api_job_result(job_id: str):
+    _authenticate()
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     if not job:
@@ -1714,6 +1732,7 @@ def api_job_result(job_id: str):
 
 @app.route("/api/jobs/<job_id>/log")
 def api_job_log(job_id: str):
+    _authenticate()
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     if not job:
@@ -1726,6 +1745,7 @@ def api_job_log(job_id: str):
 
 @app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
 def api_job_cancel(job_id: str):
+    _authenticate()
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         proc = JOB_PROCS.get(job_id)
@@ -2337,6 +2357,7 @@ def api_upload_delete(token: str):
 @app.route("/api/jobs/<job_id>/download")
 def api_job_download(job_id: str):
     """Stream the job's output directory as a zip download."""
+    _authenticate()
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     if not job:
