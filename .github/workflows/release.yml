@@ -55,12 +55,18 @@ jobs:
       - name: Smoke-install the built wheel
         # Mirrors the wheel.yml smoke, kept here so a tagged release can
         # never go out without the install-side check passing.
+        #
+        # The `.[server]` form was being resolved relative to /tmp/release-smoke
+        # (where there is no pyproject.toml) and failing with
+        # "Directory '.[server]' is not installable". The correct syntax is
+        # to attach the extra to the wheel path itself: pip install "<WHL>[server]".
         run: |
           mkdir -p /tmp/release-smoke
           cd /tmp/release-smoke
           python -m venv .venv
           .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
-          .venv/bin/pip install "$GITHUB_WORKSPACE"/dist/*.whl ".[server]" --find-links "$GITHUB_WORKSPACE"/dist
+          WHL=$(ls "$GITHUB_WORKSPACE"/dist/*.whl | head -n 1)
+          .venv/bin/pip install "${WHL}[server]" --find-links "$GITHUB_WORKSPACE"/dist
           .venv/bin/python -c "import server.app as a; print('OK routes=', len(a.app.url_map._rules))"
       - uses: actions/upload-artifact@v4
         with:
