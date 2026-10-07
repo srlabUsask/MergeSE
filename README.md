@@ -298,7 +298,8 @@ If you use MergeSE itself, please cite the tool paper:
   isbn      = {979-8-4007-2882-2},
   numpages  = {5},
   doi       = {10.1145/3832783.3834630},
-  url       = {https://doi.org/10.1145/3832783.3834630}
+  url       = {https://doi.org/10.1145/3832783.3834630},
+  note      = {Preprint: \url{https://arxiv.org/abs/2608.04181}}
 }
 ```
 

@@ -5,6 +5,11 @@ title: "MergeSE: Post-hoc Model Merging for Software Engineering Tasks Without R
 version: 0.2.0
 license: Apache-2.0
 repository-code: "https://github.com/srlabUsask/MergeSE"
+url: "https://arxiv.org/abs/2608.04181"
+identifiers:
+  - type: other
+    value: "arXiv:2608.04181"
+    description: "arXiv preprint of the ASE 2026 Tool Track paper"
 authors:
   - family-names: Roy
     given-names: "Palash R."
@@ -24,6 +29,10 @@ preferred-citation:
   title: "MergeSE: Post-hoc Model Merging for Software Engineering Tasks Without Retraining"
   year: 2026
   collection-title: "Proceedings of the 41st IEEE/ACM International Conference on Automated Software Engineering (ASE) - Tool Track"
+  url: "https://arxiv.org/abs/2608.04181"
+  identifiers:
+    - type: other
+      value: "arXiv:2608.04181"
   authors:
     - family-names: Roy
       given-names: "Palash R."
