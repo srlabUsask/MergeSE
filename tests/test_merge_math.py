@@ -661,3 +661,82 @@ def test_architecture_eval_fn_strict_rejects_wrong_layout(monkeypatch, tmp_path)
               .state_dict().items()}
     with pytest.raises(RuntimeError):
         eval_fn(bad_sd)
+
+
+@_needs_transformers
+def test_architecture_eval_fn_loads_classification_shell(monkeypatch, tmp_path):
+    """R1 (pressure retest): a wrapped BertForSequenceClassification
+    checkpoint has keys like `bert.encoder.layer.N.*` + `classifier.*`.
+    Loading those into a bare AutoModel shell was failing with strict=True
+    even though the previous iteration of the code worked without a task.
+    Eval builder must detect the wrapped layout and use a classification
+    shell to match."""
+    import csv as _csv, torch
+    from mergese import _build_architecture_eval_fn
+    from transformers import (BertConfig, BertForSequenceClassification,
+                              BertTokenizerFast)
+    cfg = BertConfig(vocab_size=50, hidden_size=16, num_hidden_layers=1,
+                     num_attention_heads=2, intermediate_size=32,
+                     max_position_embeddings=16, num_labels=2)
+    m = BertForSequenceClassification(cfg)
+    for p in m.parameters(): p.data = p.data.contiguous()
+    base_dir = tmp_path / "cls"; base_dir.mkdir()
+    m.save_pretrained(base_dir, safe_serialization=True)
+    (base_dir / "vocab.txt").write_text("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\n")
+    BertTokenizerFast(vocab_file=str(base_dir / "vocab.txt")).save_pretrained(base_dir)
+    csv_path = tmp_path / "e.csv"
+    with csv_path.open("w", newline="") as fh:
+        w = _csv.writer(fh); w.writerow(["code", "label"])
+        w.writerow(["x", "0"]); w.writerow(["y", "1"])
+
+    eval_fn = _build_architecture_eval_fn(
+        base_path=str(base_dir), resolved_eval_csv=str(csv_path),
+        limit=2, batch_size=1, max_length=8, device="cpu", task="clone_detection",
+    )
+    # The eval fn must successfully score the wrapped-cls state dict (the
+    # same thing on disk) without raising.
+    base_sd = m.state_dict()
+    score = eval_fn(base_sd)
+    assert 0.0 <= float(score) <= 1.0
+    # Provenance must report the trained head, not a random one.
+    assert not eval_fn.meta["uses_random_head"]
+    assert "AutoModelForSequenceClassification" in eval_fn.meta["head_source"]
+
+
+@_needs_transformers
+def test_architecture_eval_fn_is_deterministic_under_repeated_scoring(monkeypatch, tmp_path):
+    """R2 (pressure retest): the Dropout module was constructed but never
+    put in eval mode, so repeated scoring of the SAME state dict returned
+    different F1s (0.00, 0.22, 0.40, 0.55 observed) and the greedy search
+    could accept noise as improvement. Fix: dropout.eval(). Pin that
+    repeated calls return identical scores."""
+    import csv as _csv, torch
+    from mergese import _build_architecture_eval_fn
+    from transformers import BertConfig, BertModel, BertTokenizerFast
+    cfg = BertConfig(vocab_size=50, hidden_size=16, num_hidden_layers=1,
+                     num_attention_heads=2, intermediate_size=32,
+                     max_position_embeddings=16,
+                     hidden_dropout_prob=0.5,
+                     attention_probs_dropout_prob=0.5)
+    m = BertModel(cfg)
+    for p in m.parameters(): p.data = p.data.contiguous()
+    base_dir = tmp_path / "bare"; base_dir.mkdir()
+    m.save_pretrained(base_dir, safe_serialization=True)
+    (base_dir / "vocab.txt").write_text("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\n")
+    BertTokenizerFast(vocab_file=str(base_dir / "vocab.txt")).save_pretrained(base_dir)
+    csv_path = tmp_path / "e.csv"
+    with csv_path.open("w", newline="") as fh:
+        w = _csv.writer(fh); w.writerow(["code", "label"])
+        for _ in range(8): w.writerow(["foo", "0"]); w.writerow(["bar", "1"])
+
+    eval_fn = _build_architecture_eval_fn(
+        base_path=str(base_dir), resolved_eval_csv=str(csv_path),
+        limit=16, batch_size=4, max_length=8, device="cpu", task="",
+    )
+    base_sd = m.state_dict()
+    scores = [eval_fn(base_sd) for _ in range(5)]
+    # All 5 scores identical - no dropout randomness bleeding through.
+    assert len(set(scores)) == 1, f"non-deterministic scoring: {scores}"
+    # Random-head case must be flagged as such.
+    assert eval_fn.meta["uses_random_head"] is True
+    assert "RANDOM" in eval_fn.meta["head_source"]
