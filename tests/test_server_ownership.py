@@ -233,3 +233,80 @@ def test_upload_delete_rejects_cross_tenant(monkeypatch, tmp_path):
     assert r.status_code == 404
     # Alice's dir is still intact.
     assert d.exists()
+
+
+# ---- B03: hf:// prefix must not accept absolute-path smuggling --------------
+
+def test_hf_prefix_rejects_absolute_path(monkeypatch, tmp_path):
+    """`hf:///tmp/evil` previously returned `/tmp/evil` verbatim, bypassing
+    ALLOW_LOCAL_PATHS=0. The resolver must verify the remainder is a valid
+    HuggingFace org/name id."""
+    app = _load_app(monkeypatch, tmp_path)  # ALLOW_LOCAL_PATHS default off
+    for bad in ("hf:///tmp/evil", "hf:////etc/passwd", "hf://../../etc"):
+        with pytest.raises(ValueError, match="HuggingFace Hub id"):
+            app.resolve_model_ref(bad)
+    # Well-formed hf:// still works.
+    assert app.resolve_model_ref("hf://microsoft/codebert-base") == "microsoft/codebert-base"
+
+
+# ---- B04: path containment must be component-aware --------------------------
+
+def test_server_prefix_rejects_sibling_dir(monkeypatch, tmp_path):
+    """`server://../checkpoints_private` previously resolved outside the
+    allowed root because str.startswith on `/root/checkpoints` matched
+    `/root/checkpoints_private`. Switch to Path.relative_to catches it."""
+    allowed = tmp_path / "checkpoints"; allowed.mkdir()
+    sibling = tmp_path / "checkpoints_private"; sibling.mkdir()
+    (sibling / "config.json").write_text("{}")
+    app = _load_app(monkeypatch, tmp_path, MERGESE_CHECKPOINTS=str(allowed))
+    with pytest.raises(ValueError, match="escapes checkpoints root"):
+        app.resolve_model_ref("server://../checkpoints_private")
+
+
+def test_server_dataset_prefix_rejects_sibling_dir(monkeypatch, tmp_path):
+    allowed = tmp_path / "datasets"; allowed.mkdir()
+    sibling = tmp_path / "datasets_private"; sibling.mkdir()
+    (sibling / "secret.csv").write_text("code,label\nx,1")
+    app = _load_app(monkeypatch, tmp_path, MERGESE_DATASETS=str(allowed))
+    with pytest.raises(ValueError, match="escapes datasets root"):
+        app.resolve_dataset_ref("server-dataset://../datasets_private/secret.csv")
+
+
+# ---- B14: malformed JSON body (list, string, number) must 400 ---------------
+
+def test_json_body_rejects_non_object(monkeypatch, tmp_path):
+    app = _load_app(monkeypatch, tmp_path)
+    client = app.app.test_client()
+    for payload in (["bad"], "bad", 42, True, None):
+        import json as _json
+        body = _json.dumps(payload) if payload is not None else "null"
+        for ep in ("/api/inspect", "/api/merge", "/api/evaluate", "/api/export"):
+            r = client.post(ep, data=body, content_type="application/json")
+            # Expect 400 with a JSON error - never 500 and never HTML.
+            assert r.status_code in (400,), f"{ep} with {body!r} gave {r.status_code}"
+            assert r.content_type.startswith("application/json"), f"{ep} not JSON"
+
+
+# ---- B15: cancel of a pending job must mark it cancelled --------------------
+
+def test_cancel_pending_job(monkeypatch, tmp_path):
+    """Previously `cancel` on a pending job returned {ok:false,status:pending}
+    because no process existed yet. The new handler marks the job cancelled
+    and _run_job checks that flag before launching the worker."""
+    app = _load_app(monkeypatch, tmp_path)
+    # Hand-build a pending Job in JOBS and attempt to cancel it.
+    jid = "abc123def456"
+    (app.ARTIFACTS_ROOT / jid).mkdir(parents=True, exist_ok=True)
+    job = app.Job(
+        id=jid, cmd=["/bin/sleep", "60"], kind="merge",
+        log_path=app.ARTIFACTS_ROOT / jid / "log.txt",
+    )
+    with app.JOBS_LOCK:
+        app.JOBS[jid] = job
+    client = app.app.test_client()
+    r = client.post(f"/api/jobs/{jid}/cancel")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is True and body["status"] == "cancelled"
+    assert app.JOBS[jid].status == "cancelled"
+    assert app.JOBS[jid].finished_at is not None

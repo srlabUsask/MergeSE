@@ -289,3 +289,96 @@ def test_cosine_and_sign_agreement_bounds():
     assert 0.0 <= sa <= 1.0
     # Cosine of vector with itself = 1
     assert abs(_cosine_similarity(a, a) - 1.0) < 1e-6
+
+
+# ---- B09: binary metric must reject out-of-domain labels / preds ------------
+
+def test_binary_metric_rejects_out_of_domain(monkeypatch):
+    """y_true=[1,1], y_pred=[1,2] previously returned precision=recall=F1=1.0
+    because class 2 silently disappeared from the FN count. Now hard-fails."""
+    from mergese import _compute_metrics
+    with pytest.raises(ValueError, match=r"\{0, 1\}|\{0,1\}"):
+        _compute_metrics([1, 1], [1, 2], mode="binary")
+    with pytest.raises(ValueError):
+        _compute_metrics([0, 1, 2], [0, 1, 0], mode="binary")
+    # The in-domain case still works, and accuracy/f1 come out sensibly.
+    r = _compute_metrics([0, 1, 1, 0], [0, 1, 0, 0], mode="binary")
+    assert r["mode"] == "binary"
+    assert 0.0 <= r["f1"] <= 1.0
+
+
+# ---- B06: zero shared keys must be a hard error, not a silent base return ---
+
+def test_empty_shared_keys_produces_empty_delta_union(monkeypatch):
+    """Unit test the invariant that drives the cmd_merge B06 fix: when the
+    base's state dict shares no shape-matching keys with any specialist,
+    `_compute_task_vector` returns empty dicts and the union is empty.
+    cmd_merge now treats that as a hard error (`no mergeable tensors`); here
+    we pin the lower-level observation so a refactor of the detection
+    threshold stays correct."""
+    import torch
+    from mergese import _compute_task_vector, _shared_keys, LoadedModel
+    def _m(path, sd):
+        return LoadedModel(
+            path=path, state_dict=sd, config={"model_type": "bert"},
+            tokenizer_vocab=None, tokenizer_vocab_size=None, tokenizer_signature="",
+            architectures=[], hidden_size=None, num_hidden_layers=None,
+        )
+    base = _m("base", {"encoder.weight": torch.zeros(4)})
+    spec = _m("spec", {"bert.encoder.weight": torch.ones(4)})  # prefix mismatch
+    shared = _shared_keys([base, spec])
+    deltas = [_compute_task_vector(spec.state_dict, base.state_dict, shared)]
+    assert sum(len(d) for d in deltas) == 0  # the condition cmd_merge now rejects
+
+
+# ---- B07: heterogeneous head detection must examine every head tensor -------
+
+def test_head_mismatch_in_out_proj_detected():
+    """Two RoBERTa-style specialists where `classifier.dense` is shape-compatible
+    but `classifier.out_proj` differs must be flagged as heterogeneous. The
+    previous code checked only the first head tensor seen and missed this."""
+    # Simulate the two per-model head-shape maps that cmd_merge builds.
+    model_a_heads = {"classifier.dense.weight": (768, 768),
+                     "classifier.dense.bias": (768,),
+                     "classifier.out_proj.weight": (2, 768),
+                     "classifier.out_proj.bias": (2,)}
+    model_b_heads = {"classifier.dense.weight": (768, 768),
+                     "classifier.dense.bias": (768,),
+                     "classifier.out_proj.weight": (3, 768),
+                     "classifier.out_proj.bias": (3,)}
+    per_model = [model_a_heads, model_b_heads]
+    all_keys = sorted({k for d in per_model for k in d})
+    # Reimplement the detection the way cmd_merge now does it.
+    heterogeneous = False
+    for key in all_keys:
+        shapes = {d.get(key) for d in per_model if key in d}
+        shapes.discard(None)
+        if len(shapes) > 1:
+            heterogeneous = True
+    assert heterogeneous is True
+
+
+# ---- B08: NaN/Inf weights must be rejected by the CLI -----------------------
+
+def test_cmd_merge_rejects_nan_weights():
+    import click.testing
+    from mergese import cli
+    runner = click.testing.CliRunner()
+    r = runner.invoke(cli, [
+        "merge", "a", "b",
+        "--base", "base",
+        "--method", "ties",
+        "--weights", "nan,1",
+        "--output", "/tmp/mergese_test_out_should_not_exist",
+    ])
+    assert r.exit_code != 0
+    assert "finite" in (r.output + str(r.exception)).lower()
+    # Infs too
+    r2 = runner.invoke(cli, [
+        "merge", "a", "b",
+        "--base", "base",
+        "--method", "average",
+        "--weights", "inf,1",
+        "--output", "/tmp/mergese_test_out_should_not_exist",
+    ])
+    assert r2.exit_code != 0

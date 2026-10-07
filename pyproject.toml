@@ -47,10 +47,12 @@ server = [
 datasets = [
     "datasets>=2.18",
 ]
-# Needed by `mergese export --format onnx`. torch.onnx uses this at save-time
-# and raises an opaque OnnxExporterError without it.
+# Needed by `mergese export --format onnx`. torch.onnx uses `onnx` at
+# save-time; torch >= 2.1 also pulls `onnxscript` from its exporter path.
+# Both are pre-flighted by the CLI so a missing dep is a readable error.
 export = [
     "onnx>=1.14",
+    "onnxscript>=0.1",
 ]
 dev = [
     "pytest>=8.0",
@@ -68,10 +70,34 @@ Homepage = "https://github.com/srlabUsask/MergeSE"
 Repository = "https://github.com/srlabUsask/MergeSE"
 Issues = "https://github.com/srlabUsask/MergeSE/issues"
 
+# ---- packaging ---------------------------------------------------------------
+# The web tool and the bundled benchmark CSVs live outside any Python package,
+# so a bare `pip install mergese` would ship only the Python modules and the
+# server would 404 for / and expose no bundled datasets (B13). Install them as
+# `data-files` under `share/mergese/...`; the server's _first_existing_dir
+# helper searches that location when the repo-tree copies are absent.
 [tool.setuptools]
 py-modules = ["mergese", "mergese_tasks"]
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["server*"]
 exclude = ["artifacts*", "uploads*", "tests*", "deploy*", "frontend*", "data*"]
+
+[tool.setuptools.package-data]
+"server" = ["*.json"]
+
+[tool.setuptools.data-files]
+"share/mergese/frontend" = [
+    "frontend/index.html",
+    "frontend/app.js",
+    "frontend/styles.css",
+    "frontend/favicon.svg",
+]
+"share/mergese/data/benchmarks" = [
+    "data/benchmarks/index.json",
+    "data/benchmarks/bigclonebench_demo.csv",
+    "data/benchmarks/clcdsa_demo.csv",
+    "data/benchmarks/gptclonebench_demo.csv",
+]

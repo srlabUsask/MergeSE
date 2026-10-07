@@ -11,5 +11,7 @@ flask-cors>=4.0
 gunicorn>=21.2
 # HuggingFace Datasets (server picks them up if installed; pure-python fallback otherwise)
 datasets>=2.18
-# ONNX export (`mergese export --format onnx`). torch.onnx can't save without it.
+# ONNX export (`mergese export --format onnx`). torch.onnx can't save without
+# onnx; torch >= 2.1 also imports onnxscript during the export call.
 onnx>=1.14
+onnxscript>=0.1

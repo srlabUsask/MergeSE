@@ -65,7 +65,38 @@ from werkzeug.utils import secure_filename
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-FRONTEND = ROOT / "frontend"
+
+
+def _first_existing_dir(candidates: List[Path], expect_file: Optional[str] = None) -> Path:
+    """Return the first candidate directory that exists (and, when
+    `expect_file` is given, contains that file). Falls back to the first
+    candidate when nothing matches - keeps dev-tree behaviour unchanged while
+    letting a wheel install resolve data from `sys.prefix/share/mergese/...`."""
+    for c in candidates:
+        if c.is_dir() and (expect_file is None or (c / expect_file).exists()):
+            return c
+    return candidates[0]
+
+
+# Candidate layouts, in search order:
+#   1. repo tree  (dev)                 - ROOT/frontend, ROOT/data/benchmarks
+#   2. wheel install  (`pip install mergese`) - sys.prefix/share/mergese/...
+#   3. user install  (`pip install --user`)   - site.USER_BASE/share/mergese/...
+# `data-files` entries in pyproject.toml deposit files at option 2/3.
+try:
+    import site
+    _USER_BASE = Path(site.getuserbase())
+except Exception:
+    _USER_BASE = Path.home()
+_PREFIX = Path(sys.prefix)
+FRONTEND = _first_existing_dir(
+    [
+        ROOT / "frontend",
+        _PREFIX / "share" / "mergese" / "frontend",
+        _USER_BASE / "share" / "mergese" / "frontend",
+    ],
+    expect_file="index.html",
+)
 
 # Ensure sibling modules (auth.py) import cleanly no matter how app.py is
 # launched - `python server/app.py`, gunicorn, or importlib-by-path in tests.
@@ -74,10 +105,27 @@ if str(HERE) not in sys.path:
 
 # ---- config from env ---------------------------------------------------------
 
-MERGESE_BIN = os.environ.get("MERGESE_BIN", sys.executable + " " + str(ROOT / "mergese.py"))
+# Default MERGESE_BIN: prefer the repo copy if present, else `python -m mergese`
+# so a wheel install (where mergese.py isn't under ROOT) still works.
+_default_bin = (
+    sys.executable + " " + str(ROOT / "mergese.py")
+    if (ROOT / "mergese.py").exists()
+    else sys.executable + " -m mergese"
+)
+MERGESE_BIN = os.environ.get("MERGESE_BIN", _default_bin)
 CHECKPOINTS_ROOT = os.environ.get("MERGESE_CHECKPOINTS", "")
 DATASETS_ROOT = os.environ.get("MERGESE_DATASETS", "")  # optional admin-mounted CSVs
-BENCHMARKS_ROOT = Path(os.environ.get("MERGESE_BENCHMARKS", str(ROOT / "data" / "benchmarks")))
+BENCHMARKS_ROOT = Path(os.environ.get(
+    "MERGESE_BENCHMARKS",
+    str(_first_existing_dir(
+        [
+            ROOT / "data" / "benchmarks",
+            _PREFIX / "share" / "mergese" / "data" / "benchmarks",
+            _USER_BASE / "share" / "mergese" / "data" / "benchmarks",
+        ],
+        expect_file="index.json",
+    )),
+))
 ARTIFACTS_ROOT = Path(os.environ.get("MERGESE_ARTIFACTS", str(ROOT / "artifacts")))
 UPLOADS_ROOT = Path(os.environ.get("MERGESE_UPLOADS", str(ROOT / "uploads")))
 DATASET_UPLOADS_ROOT = UPLOADS_ROOT / "_datasets"
@@ -417,6 +465,39 @@ def _owns(dir_path: Path, owner: Optional[str]) -> bool:
 _HF_ID = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$")
 
 
+def _json_body() -> dict:
+    """Parse and validate a request body as a JSON object.
+
+    Raises werkzeug's `BadRequest` (-> 400 with a readable error) when the body
+    isn't valid JSON OR when it is valid JSON but not an object (e.g. a list,
+    a string, a number). Without this check, a `request.get_json(force=True) or {}`
+    on a list body sailed through and the next `body.get(...)` call raised
+    AttributeError, which Flask converted to an opaque 500.
+    """
+    body = request.get_json(force=True, silent=True)
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        abort(400, description="request body must be a JSON object")
+    return body
+
+
+def _contained_in(path: Path, root: Path) -> bool:
+    """True iff `path` is `root` or a descendant of it.
+
+    Replaces the earlier `str(path).startswith(str(root))` style check, which
+    accepted sibling directories whose name happened to share the same prefix
+    (e.g. root=/opt/mergese/checkpoints, path=/opt/mergese/checkpoints_private
+    matched the prefix). `Path.relative_to` does the real component-wise
+    containment check and treats resolved symlink escapes correctly too.
+    """
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 def resolve_model_ref(ref: str, owner: Optional[str] = None) -> str:
     """Turn a frontend model reference into a path/HF id the CLI can consume.
 
@@ -444,8 +525,9 @@ def resolve_model_ref(ref: str, owner: Optional[str] = None) -> str:
         token = ref[len("upload://"):].strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", token):
             raise ValueError(f"bad upload token: {token!r}")
-        path = (UPLOADS_ROOT / token).resolve()
-        if not str(path).startswith(str(UPLOADS_ROOT.resolve())):
+        root = UPLOADS_ROOT.resolve()
+        path = (root / token).resolve()
+        if not _contained_in(path, root):
             raise ValueError("upload path escapes uploads root")
         if not path.exists() or not _owns(path, owner):
             raise ValueError(f"upload not found: {token}")
@@ -457,7 +539,7 @@ def resolve_model_ref(ref: str, owner: Optional[str] = None) -> str:
             raise ValueError("server-side checkpoints are not configured")
         root = Path(CHECKPOINTS_ROOT).resolve()
         path = (root / name).resolve()
-        if not str(path).startswith(str(root)):
+        if not _contained_in(path, root):
             raise ValueError("server path escapes checkpoints root")
         if not path.exists():
             raise ValueError(f"server checkpoint not found: {name}")
@@ -473,7 +555,8 @@ def resolve_model_ref(ref: str, owner: Optional[str] = None) -> str:
         if not re.fullmatch(r"[A-Za-z0-9]{6,32}", jid):
             raise ValueError(f"bad job id in ref: {jid!r}")
         sub = parts[1] if len(parts) > 1 else None
-        root = ARTIFACTS_ROOT.resolve() / jid
+        art_root = ARTIFACTS_ROOT.resolve()
+        root = art_root / jid
         if not root.exists() or not _owns(root, owner):
             raise ValueError(f"job artifact not found: {jid}")
         if sub:
@@ -484,14 +567,21 @@ def resolve_model_ref(ref: str, owner: Optional[str] = None) -> str:
             cand = (root / "merged").resolve()
             if not cand.exists():
                 cand = (root / "exported").resolve()
-        if not str(cand).startswith(str(ARTIFACTS_ROOT.resolve())):
+        if not _contained_in(cand, art_root):
             raise ValueError("job ref escapes artifacts root")
         if not cand.exists():
             raise ValueError(f"job output not found for {jid}")
         return str(cand)
 
     if ref.startswith("hf://"):
-        return ref[len("hf://"):]
+        # Everything after the prefix must look like an HF Hub id (org/name).
+        # Without this check, `hf:///tmp/evil` would be returned verbatim and
+        # fed into AutoModel.from_pretrained as an absolute path - defeating
+        # ALLOW_LOCAL_PATHS=0.
+        hf_id = ref[len("hf://"):]
+        if not _HF_ID.match(hf_id) or "/" not in hf_id or hf_id.startswith("/"):
+            raise ValueError(f"not a HuggingFace Hub id: {hf_id!r}")
+        return hf_id
 
     # Absolute paths: only when the operator explicitly opts in
     if ref.startswith("/") or ref.startswith("\\") or ":" in ref[:3]:
@@ -547,9 +637,10 @@ def resolve_dataset_ref(ref: str, owner: Optional[str] = None) -> str:
         token = ref[len("dataset://"):].strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", token):
             raise ValueError(f"bad dataset token: {token!r}")
-        dir_path = (DATASET_UPLOADS_ROOT / token).resolve()
+        root = DATASET_UPLOADS_ROOT.resolve()
+        dir_path = (root / token).resolve()
         path = (dir_path / "data.csv").resolve()
-        if not str(path).startswith(str(DATASET_UPLOADS_ROOT.resolve())):
+        if not _contained_in(path, root):
             raise ValueError("dataset path escapes uploads root")
         if not path.exists() or not _owns(dir_path, owner):
             raise ValueError(f"uploaded dataset not found: {token}")
@@ -565,7 +656,7 @@ def resolve_dataset_ref(ref: str, owner: Optional[str] = None) -> str:
         if not cand.exists() and not cand.suffix:
             cand = root / f"{name}.csv"
         cand = cand.resolve()
-        if not str(cand).startswith(str(root)):
+        if not _contained_in(cand, root):
             raise ValueError("server-dataset path escapes datasets root")
         if not cand.exists():
             raise ValueError(f"server-dataset not found: {name}")
@@ -949,7 +1040,12 @@ def _build_worker(job: Job, logf) -> subprocess.Popen:
 
 def _run_job(job: Job) -> None:
     with RUN_SEMA:
+        # Honour a cancel issued while the job was queued: the user cancelled
+        # before our turn in the RUN_SEMA, so we just don't launch the worker.
         with JOBS_LOCK:
+            if job.status == "cancelled":
+                job.finished_at = job.finished_at or time.time()
+                return
             job.status = "running"
             job.started_at = time.time()
         try:
@@ -1146,7 +1242,7 @@ def _cli_version() -> str:
 @app.route("/api/inspect", methods=["POST"])
 def api_inspect():
     owner = _authenticate()
-    body = request.get_json(force=True) or {}
+    body = _json_body()
     models = body.get("models") or []
     base = body.get("base")
     if len(models) < 2:
@@ -1173,7 +1269,7 @@ def api_inspect():
 @app.route("/api/merge", methods=["POST"])
 def api_merge():
     owner = _authenticate()
-    body = request.get_json(force=True) or {}
+    body = _json_body()
     models = body.get("models") or []
     base = body.get("base")
     method = body.get("method", "ties")
@@ -1242,7 +1338,7 @@ def api_merge():
 @app.route("/api/evaluate", methods=["POST"])
 def api_evaluate():
     owner = _authenticate()
-    body = request.get_json(force=True) or {}
+    body = _json_body()
     model = body.get("model")
     task = body.get("task", "clone_detection")
     dataset = body.get("dataset")
@@ -1294,7 +1390,7 @@ def api_evaluate():
 @app.route("/api/export", methods=["POST"])
 def api_export():
     owner = _authenticate()
-    body = request.get_json(force=True) or {}
+    body = _json_body()
     model = body.get("model")
     fmt = body.get("format", "huggingface")
     if not model:
@@ -1314,9 +1410,18 @@ def api_export():
     if fmt == "huggingface":
         out_path = base_out / "exported"
     elif fmt == "onnx":
-        out_path = base_out / "model.onnx"
+        # torch.onnx writes external-data files (model.onnx + sibling blobs)
+        # once the model exceeds the 2 GB protobuf limit. Writing to a
+        # dedicated subdir keeps those siblings together so the download zip
+        # can include every piece - a bare `model.onnx` file would lose the
+        # external data and fail onnx.checker on extraction.
+        onnx_dir = base_out / "exported"
+        onnx_dir.mkdir(parents=True, exist_ok=True)
+        out_path = onnx_dir / "model.onnx"
     else:
-        out_path = base_out / "model.pt"
+        ts_dir = base_out / "exported"
+        ts_dir.mkdir(parents=True, exist_ok=True)
+        out_path = ts_dir / "model.pt"
 
     args = ["export", resolved_model, "--format", fmt, "--output", str(out_path)]
     job = _new_job("export", args, body, job_id=job_id, owner=owner)
@@ -1410,6 +1515,18 @@ def api_job_cancel(job_id: str):
             return jsonify({"error": str(e)}), 500
         with JOBS_LOCK:
             job.finished_at = time.time()
+        return jsonify({"ok": True, "status": "cancelled"})
+    # Pending jobs: no process has started yet, but _run_job will check this
+    # status flag before launching the subprocess. Marking the job cancelled
+    # here means the worker simply never starts.
+    if job.status == "pending":
+        with JOBS_LOCK:
+            job.status = "cancelled"
+            job.finished_at = time.time()
+        try:
+            job.log_path.write_text("[mergese] cancelled by user while queued\n")
+        except OSError:
+            pass
         return jsonify({"ok": True, "status": "cancelled"})
     return jsonify({"ok": False, "status": job.status})
 
@@ -1999,8 +2116,12 @@ def api_job_download(job_id: str):
 
     # Pick the right artifact directory:
     #   merge   -> artifacts/<id>/merged
-    #   export  -> artifacts/<id>/exported  OR  artifacts/<id>/model.onnx / .pt
+    #   export  -> artifacts/<id>/exported  (always a dir now, including the
+    #              ONNX case where sibling external-data files must travel with
+    #              the main .onnx file; see api_export)
     #   else    -> artifacts/<id>  (logs + result.json)
+    # Legacy pre-fix exports placed .onnx/.pt at the job root; fall back to
+    # those so a download of an old job still succeeds.
     job_root = ARTIFACTS_ROOT / job_id
     target: Optional[Path] = None
     if job.kind == "merge":
@@ -2188,6 +2309,13 @@ def api_limits():
 
 
 # ---- error handlers ----------------------------------------------------------
+
+@app.errorhandler(400)
+def _bad_request(e):
+    """Make `abort(400, description=...)` return JSON so API clients can parse
+    the error. Without this handler the default is Werkzeug's HTML page."""
+    return jsonify({"error": getattr(e, "description", "bad request")}), 400
+
 
 @app.errorhandler(413)
 def too_large(e):
