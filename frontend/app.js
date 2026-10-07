@@ -118,12 +118,42 @@ async function useApiKey() {
 
 // Returns true if the app may boot immediately; false means the gate is up and
 // will boot the app once the visitor authenticates.
+//
+// Policy change (external review, Oct 2026): don't greet first-time visitors
+// with a full-page Turnstile modal. Let them read the hero + docs first,
+// then challenge only when they try to USE the workspace. The old modal
+// loaded over a blurred page and read as "we don't want to show you our
+// product" even though we do. We boot the public read-only surface right
+// away and defer the gate to `ensureWorkspaceAuth` below.
 async function ensureAuth() {
   if (!AUTH.required) return true;
   const stored = loadStoredToken();
   if (stored) { AUTH.token = stored; return true; }
-  showGate();
-  return false;
+  // No stored token - but DON'T show the gate yet. Boot the app so the
+  // visitor can look around; the submit handlers will call
+  // `ensureWorkspaceAuth` right before firing a real job.
+  return true;
+}
+
+// Called by workspace-mutating actions (merge/inspect/evaluate/export submit,
+// upload) to require a Turnstile pass or API key first. Returns a promise
+// that resolves true once the visitor has a token, or false if they close
+// the gate.
+async function ensureWorkspaceAuth() {
+  if (!AUTH.required) return true;
+  if (AUTH.token) return true;
+  const stored = loadStoredToken();
+  if (stored) { AUTH.token = stored; return true; }
+  // Show the modal and wait for the exchange to complete.
+  return new Promise((resolve) => {
+    const check = () => {
+      if (AUTH.token) { resolve(true); return; }
+      if ($("#authGate").hidden) { resolve(false); return; }
+      setTimeout(check, 200);
+    };
+    showGate("Verify to run a job. This stays off until you submit.");
+    check();
+  });
 }
 
 async function api(path, opts = {}) {
@@ -174,6 +204,12 @@ async function checkHealth() {
     const h = await api("/api/health");
     el.textContent = `backend online · ${h.version}`;
     line.classList.remove("bad");
+    // Mirror the version onto the hero credits strip so a reviewer can read
+    // "which release of the tool is this" without opening devtools.
+    const pill = $("#versionPill");
+    if (pill && h.version) {
+      pill.innerHTML = `<strong>Version:</strong> <code>${String(h.version).replace(/^mergese\.py, version /, "")}</code>`;
+    }
   } catch (e) {
     el.textContent = `backend offline (${e.message}) - append ?api=https://... to point elsewhere`;
     line.classList.add("bad");
@@ -779,6 +815,13 @@ function applyPreset(kind) {
 async function submit(path, body, opts) {
   if (DEMO) {
     toast("Demo mode - backend disabled. Try locally with `python server/app.py`.", "err");
+    return null;
+  }
+  // Deferred Turnstile pass: show the gate only when the visitor actually
+  // tries to run a job, not on page load (external UX review, Oct 2026).
+  const authed = await ensureWorkspaceAuth();
+  if (!authed) {
+    toast(`${opts.kind} cancelled - verification not completed`, "err");
     return null;
   }
   try {
