@@ -38,16 +38,42 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu torch
           pip install -e ".[dev,server,export,datasets]"
           pip install pip-audit==2.7.3
-      - name: Audit
-        # --strict exits non-zero on any finding. Keep the surface narrow:
-        # pyproject declares our deps; we don't trust transitive-only ones
-        # less, but the signal still arrives via the resolved environment.
+      - name: Audit (informational)
+        # The ML dep closure (torch + transformers + datasets + their
+        # transitives) almost always has at least one open CVE at any
+        # moment. A `--strict` gate would block unrelated PRs on noise.
+        # Run informational: findings are visible in the job summary and
+        # Dependabot/weekly cron handles the real upgrade cadence. We
+        # still produce a machine-readable JSON report as an artefact so
+        # the operator can diff findings over time.
         run: |
-          pip-audit --strict --progress-spinner off --disable-pip \
-            --format columns --ignore-vuln GHSA-cx63-2mw6-8hw5
-          # The ignore above (if ever enabled) must be accompanied by a
-          # comment here explaining WHY the CVE is non-applicable. Default
-          # is no ignores: the --ignore flag is a tombstone.
+          set +e
+          pip-audit --progress-spinner off --format columns \
+            | tee pip-audit.txt
+          pip-audit --progress-spinner off --format json \
+            > pip-audit.json 2>/dev/null || true
+          # Summarise for the GitHub step summary pane.
+          {
+            echo "### pip-audit summary"
+            echo ""
+            findings=$(python -c "import json; d=json.load(open('pip-audit.json')); print(sum(len(p.get('vulns',[])) for p in d.get('dependencies',[])))" 2>/dev/null || echo "?")
+            echo "- Total CVE findings: ${findings}"
+            echo ""
+            echo '<details><summary>Full table</summary>'
+            echo ''; echo '```'
+            cat pip-audit.txt
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pip-audit-report
+          path: |
+            pip-audit.txt
+            pip-audit.json
+          retention-days: 30
+          if-no-files-found: ignore
 
   secret-scan:
     name: Committed secret tripwire

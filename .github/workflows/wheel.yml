@@ -80,7 +80,11 @@ jobs:
           python -m venv .venv
           # Install CPU torch first so the mergese dep resolver picks it up.
           .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
-          .venv/bin/pip install "$GITHUB_WORKSPACE"/dist/*.whl ".[server]" --find-links "$GITHUB_WORKSPACE"/dist
+          # Install the wheel with its `server` extra. The `WHL[extra]`
+          # syntax attaches the extra to the wheel file; a bare `.[server]`
+          # here would refer to /tmp/wheel-smoke (not a package) and fail.
+          WHL=$(ls "$GITHUB_WORKSPACE"/dist/mergese-*.whl | head -1)
+          .venv/bin/pip install "${WHL}[server]"
 
       - name: Start server from the install (NOT from the checkout)
         env:
