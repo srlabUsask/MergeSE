@@ -5,14 +5,109 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+# Cancel in-flight runs for the same PR when a new push arrives. Keeps the
+# feedback cycle fast and avoids wasting Actions minutes on superseded commits.
+# Pushes to main are never cancelled (we want the record for every merged
+# commit).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
 
 jobs:
-  test:
+  # ------------------------------------------------------------------
+  # Lightweight checks that fan out quickly - fail fast on obvious
+  # mistakes before the heavier test matrix even starts.
+  # ------------------------------------------------------------------
+  lint:
+    name: Lint + static checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install linter
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.6.9
+      - name: ruff (unused imports, syntax, security basics)
+        # Rule set is tuned in pyproject.toml [tool.ruff.lint]. Deliberately
+        # narrow so day-1 CI doesn't drown PRs in style nits - project can
+        # tighten later once the baseline is clean.
+        run: ruff check --output-format=github mergese.py mergese_tasks.py server/ tests/
+
+  frontend-syntax:
+    name: Frontend syntax check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Validate app.js parses as modern browser JS
+        # Can't just `node --check` - the file uses browser APIs (fetch,
+        # window, DOM). Use acorn, which parses modern JS without needing a
+        # DOM shim and reports syntax errors with line numbers.
+        run: |
+          npm install --no-fund --no-audit --silent acorn@8
+          node -e "require('acorn').parse(require('fs').readFileSync('frontend/app.js','utf8'),{ecmaVersion:'latest',sourceType:'script'});console.log('frontend/app.js parses OK')"
+
+  preset-schema:
+    name: Preset catalogue sanity
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Reject filesystem paths in presets.json
+        # One of the earlier audits caught 4 of 5 merge presets shipping
+        # with ./checkpoints/<name> paths that only existed on the author's
+        # dev box. Pin that regression in CI directly, outside pytest, so a
+        # malformed presets.json fails the pipeline even if the test suite
+        # has an unrelated red.
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+          data = json.loads(pathlib.Path("server/presets.json").read_text())
+          bad = []
+          for p in data["presets"]:
+              body = p.get("body", {})
+              refs = list(body.get("models") or [])
+              for k in ("base", "model"):
+                  if body.get(k): refs.append(body[k])
+              for ref in refs:
+                  if ref.startswith(("./","../","/")) or "\\" in ref:
+                      bad.append((p.get("name"), ref))
+          if bad:
+              for name, ref in bad: print(f"::error::preset {name!r} references non-portable path {ref!r}")
+              sys.exit(1)
+          print(f"OK: {len(data['presets'])} presets validate cleanly")
+          PY
+
+  # ------------------------------------------------------------------
+  # Full test matrix. Separate job per Python version so failures are
+  # attributable without reading a wall of logs. fail-fast=false so one
+  # red version doesn't short-circuit the others - we want to know if a
+  # new 3.12 incompatibility slips in while 3.11 is still green.
+  # ------------------------------------------------------------------
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11"]
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
@@ -27,8 +122,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu torch
 
-      - name: Install package with test dependencies
-        run: pip install ".[dev]"
+      - name: Install package with dev + server + export deps
+        run: pip install -e ".[dev,server,export]"
 
-      - name: Run test suite
-        run: pytest -q
+      - name: Run test suite with coverage
+        run: |
+          pip install coverage[toml]
+          coverage run -m pytest -q --maxfail=5
+          coverage xml -o coverage.xml
+          coverage report --fail-under=55
+
+      - name: Upload coverage artefact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-py${{ matrix.python-version }}
+          path: coverage.xml
+          retention-days: 14
+          if-no-files-found: ignore

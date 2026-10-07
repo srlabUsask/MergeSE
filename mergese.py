@@ -54,10 +54,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 import random
-import shutil
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,7 +63,6 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import click
 
 from mergese_tasks import (
-    TaskSpec,
     all_tasks,
     detect_input_kind,
     get as get_task,

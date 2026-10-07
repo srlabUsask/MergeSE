@@ -101,3 +101,41 @@ exclude = ["artifacts*", "uploads*", "tests*", "deploy*", "frontend*", "data*"]
     "data/benchmarks/clcdsa_demo.csv",
     "data/benchmarks/gptclonebench_demo.csv",
 ]
+
+# ---- ruff ---------------------------------------------------------------
+# Focus on actual bug classes, not style nits. The CI job runs
+# `ruff check mergese.py mergese_tasks.py server/ tests/` with these rules.
+# Expand later if the team wants stricter formatting.
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = [
+    "artifacts",
+    "uploads",
+    ".venv",
+    "build",
+    "dist",
+]
+
+[tool.ruff.lint]
+# Narrow to rules that catch real bugs without noise:
+# E9  -> syntax errors (parse failures, invalid tokens)
+# F4  -> import issues (F401 unused, F403 star-import, F405 undefined-from-star)
+# F6  -> literal + redefinition bugs (F601, F602, F621, ...)
+# F7  -> syntax issues python flagged (F701, F702, ...)
+# F81 -> F811 only (redefinition of unused name)
+# F9  -> boolean/if/assignment smells
+# W6  -> deprecated syntax (invalid escape sequences etc)
+# S102, S106, S108 -> exec / hard-coded password / /tmp paths (not S110 bare-pass:
+#        the project uses OSError-swallow pattern deliberately)
+#
+# F821 (undefined-name) is OFF because mergese.py uses a lazy-import pattern
+# (`torch = _lazy_torch()`) that ruff can't follow without a type stub.
+# B (bugbear) is OFF for now to keep the first-day CI green; graduate later.
+select = ["E9", "F4", "F6", "F7", "F81", "F9", "W6", "S102", "S106", "S108"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately redefine fixtures, import for side effects, and set
+# disposable "test-secret" strings - no S106 (hardcoded password) complaints.
+"tests/*" = ["F401", "F811", "S106", "S108"]

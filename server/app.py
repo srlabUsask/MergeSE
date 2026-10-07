@@ -40,7 +40,6 @@ Model references in API calls can be one of:
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import re
@@ -548,10 +547,18 @@ def _field_number(body: dict, key: str, *, default: Optional[float] = None,
         return default
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         abort(400, description=f"{key!r} must be a number, got {type(v).__name__}")
+    # NaN / +Inf / -Inf pass isinstance(float) and skate through range checks
+    # (NaN comparisons always evaluate False), then crash later at int(NaN)
+    # or in the merge driver. Reject at the parse boundary.
+    import math as _math
+    if isinstance(v, float) and not _math.isfinite(v):
+        abort(400, description=f"{key!r} must be a finite number, got {v!r}")
     if min_value is not None and v < min_value:
         abort(400, description=f"{key!r} must be >= {min_value}")
     if max_value is not None and v > max_value:
         abort(400, description=f"{key!r} must be <= {max_value}")
+    if as_int and isinstance(v, float) and not v.is_integer():
+        abort(400, description=f"{key!r} must be an integer, got {v}")
     return int(v) if as_int else float(v)
 
 
@@ -1457,7 +1464,7 @@ def api_evaluate():
             "--limit", str(limit),
             "--metric", metric]
 
-    dataset_ref = body.get("dataset_ref")
+    dataset_ref = _field_str(body, "dataset_ref")
     if dataset_ref:
         try:
             csv_path = resolve_dataset_ref(dataset_ref, owner=owner)

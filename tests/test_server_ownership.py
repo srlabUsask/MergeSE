@@ -365,3 +365,42 @@ def test_json_body_rejects_bad_field_types(monkeypatch, tmp_path):
             msg = r.get_json()["error"]
             # Message should mention the bad field, not just "bad request".
             assert any(k in msg for k in body.keys()) or "format" in msg or "metric" in msg
+
+
+# ---- B14 (retest round 2) — dataset_ref type + NaN numerics -----------------
+
+def test_evaluate_rejects_non_string_dataset_ref(monkeypatch, tmp_path):
+    """`{"model": "org/x", "dataset_ref": 42}` previously 500'd because
+    api_evaluate read dataset_ref via raw body.get and passed an int into
+    resolve_dataset_ref's string ops. Validate as a string first."""
+    app = _load_app(monkeypatch, tmp_path)
+    client = app.app.test_client()
+    for bad in (42, ["bundled://bigclonebench"], {"ref": "x"}, 3.14):
+        r = client.post("/api/evaluate",
+                        json={"model": "org/x", "dataset_ref": bad},
+                        content_type="application/json")
+        assert r.status_code == 400, f"dataset_ref={bad!r} -> {r.status_code}"
+        assert "dataset_ref" in r.get_json()["error"]
+
+
+def test_number_fields_reject_nan_and_inf(monkeypatch, tmp_path):
+    """`batch_size: NaN` previously reached `int(NaN)` and 500'd. NaN/Inf
+    pass the type check AND skate past range comparisons (all comparisons
+    with NaN are False), so the finiteness check has to be explicit."""
+    app = _load_app(monkeypatch, tmp_path)
+    client = app.app.test_client()
+    import math as _m
+    for bad in (_m.nan, _m.inf, -_m.inf):
+        r = client.post("/api/evaluate",
+                        json={"model": "org/x", "batch_size": bad},
+                        content_type="application/json")
+        assert r.status_code == 400, f"batch_size={bad!r} -> {r.status_code}"
+        err = r.get_json()["error"].lower()
+        assert "batch_size" in err and ("finite" in err or "nan" in err.lower() or "inf" in err.lower())
+    # Fractional values for int fields are also rejected (3.14 -> int(3.14)=3
+    # would silently truncate).
+    r = client.post("/api/evaluate",
+                    json={"model": "org/x", "batch_size": 3.14},
+                    content_type="application/json")
+    assert r.status_code == 400
+    assert "integer" in r.get_json()["error"].lower()

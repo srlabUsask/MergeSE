@@ -1,0 +1,142 @@
+name: Wheel install smoke
+
+# A fresh `pip install mergese` has to serve the UI and the bundled datasets
+# from the install location, not from the repo tree. This workflow catches
+# the whole class of regressions (B13 and future friends) by building an
+# sdist + wheel, installing them into a clean venv OUTSIDE the checkout,
+# starting the server with no checkout on PYTHONPATH, and curl-ing the
+# endpoints a visitor would hit.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - "pyproject.toml"
+      - "setup.cfg"
+      - "setup.py"
+      - "MANIFEST.in"
+      - "server/**"
+      - "frontend/**"
+      - "data/benchmarks/**"
+      - "mergese.py"
+      - "mergese_tasks.py"
+      - ".github/workflows/wheel.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: wheel-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  wheel-install:
+    name: Build wheel + sdist, install clean, probe server
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install build backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install build==1.2.2
+
+      - name: Build sdist + wheel
+        run: python -m build --sdist --wheel --outdir dist
+
+      - name: Inspect wheel contents
+        # Sanity: the wheel must contain presets.json, the frontend assets,
+        # and the bundled benchmark CSVs. zipgrep is faster than extracting.
+        run: |
+          set -e
+          whl=$(ls dist/*.whl | head -1)
+          echo "== wheel: $whl =="
+          python -m zipfile -l "$whl" | sed -n '1,80p'
+          for required in \
+              "server/presets.json" \
+              "share/mergese/frontend/index.html" \
+              "share/mergese/frontend/app.js" \
+              "share/mergese/data/benchmarks/index.json" \
+              "share/mergese/data/benchmarks/bigclonebench_demo.csv"; do
+            if ! python -m zipfile -l "$whl" | grep -q "$required"; then
+              echo "::error::wheel is missing $required"; exit 1
+            fi
+          done
+
+      - name: Install the wheel into a FRESH venv (no repo on sys.path)
+        run: |
+          set -e
+          mkdir -p /tmp/wheel-smoke
+          cd /tmp/wheel-smoke
+          python -m venv .venv
+          # Install CPU torch first so the mergese dep resolver picks it up.
+          .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
+          # Install the wheel with its `server` extra. The `WHL[extra]`
+          # syntax attaches the extra to the wheel file; a bare `.[server]`
+          # here would refer to /tmp/wheel-smoke (not a package) and fail.
+          WHL=$(ls "$GITHUB_WORKSPACE"/dist/mergese-*.whl | head -1)
+          .venv/bin/pip install "${WHL}[server]"
+
+      - name: Start server from the install (NOT from the checkout)
+        env:
+          MERGESE_HOST: "127.0.0.1"
+          MERGESE_PORT: "18870"
+          MERGESE_REQUIRE_AUTH: "0"
+        run: |
+          set -e
+          cd /tmp/wheel-smoke   # critical: NOT the repo root
+          nohup .venv/bin/python -m server.app > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 30); do
+            if curl -sS http://127.0.0.1:18870/api/health >/dev/null 2>&1; then
+              echo "server up after ${i}s"; break
+            fi
+            sleep 1
+          done
+          curl -sS http://127.0.0.1:18870/api/health
+
+      - name: Hit the endpoints a visitor would hit
+        run: |
+          set -e
+          for path in / /index.html /app.js /styles.css /favicon.svg /api/health /api/v1/config /api/tasks /api/presets; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:18870${path}")
+            echo "  ${code}  ${path}"
+            if [ "$code" != "200" ]; then
+              echo "::error::endpoint ${path} returned ${code} from a clean wheel install"
+              exit 1
+            fi
+          done
+          # Bundled datasets must list all three samples.
+          python - <<'PY'
+          import json, urllib.request, sys
+          d = json.loads(urllib.request.urlopen("http://127.0.0.1:18870/api/library").read())
+          names = {b.get("ref") for b in d["datasets"]["bundled"]}
+          want = {"bundled://bigclonebench", "bundled://clcdsa", "bundled://gptclonebench"}
+          missing = want - names
+          if missing:
+              print("::error::wheel install missing bundled datasets:", missing); sys.exit(1)
+          print("OK: all 3 bundled datasets visible from the wheel install")
+          PY
+
+      - name: Shut server down
+        if: always()
+        run: |
+          cd /tmp/wheel-smoke
+          [ -f server.pid ] && kill "$(cat server.pid)" 2>/dev/null || true
+          [ -f server.log ] && tail -40 server.log || true
+
+      - name: Upload dist artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 14
