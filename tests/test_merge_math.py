@@ -740,3 +740,58 @@ def test_architecture_eval_fn_is_deterministic_under_repeated_scoring(monkeypatc
     # Random-head case must be flagged as such.
     assert eval_fn.meta["uses_random_head"] is True
     assert "RANDOM" in eval_fn.meta["head_source"]
+
+
+@_needs_transformers
+def test_sidecar_classifier_head_travels_with_merge_output(tmp_path):
+    """R-save (pressure retest round 3): architecture merge against a
+    sidecar fine-tune used `classifier_head.bin` for scoring but dropped
+    it from the saved output - a reload fell back to a random classifier.
+    `save_merged_checkpoint` must copy sidecar heads + their companions."""
+    import torch
+    from mergese import save_merged_checkpoint, _build_architecture_eval_fn
+    from transformers import BertConfig, BertModel, BertTokenizerFast
+    cfg = BertConfig(vocab_size=50, hidden_size=16, num_hidden_layers=1,
+                     num_attention_heads=2, intermediate_size=32,
+                     max_position_embeddings=16)
+    base_dir = tmp_path / "sidecar_base"; base_dir.mkdir()
+    m = BertModel(cfg)
+    for p in m.parameters(): p.data = p.data.contiguous()
+    m.save_pretrained(base_dir, safe_serialization=True)
+    (base_dir / "vocab.txt").write_text("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\n")
+    BertTokenizerFast(vocab_file=str(base_dir / "vocab.txt")).save_pretrained(base_dir)
+    # Plant a sidecar classifier head + config in the base dir.
+    classifier = torch.nn.Linear(16, 2)
+    for p in classifier.parameters(): p.data = p.data.contiguous()
+    torch.save(
+        {"num_labels": 2, "dropout": 0.1, "classifier": classifier.state_dict()},
+        base_dir / "classifier_head.bin",
+    )
+    (base_dir / "clone_detection_config.json").write_text(
+        '{"num_labels": 2, "dropout": 0.1}'
+    )
+    (base_dir / "best_metrics.json").write_text(
+        '{"best_f1": 0.5, "best_epoch": 1}'
+    )
+
+    # Save the merge output.
+    out_dir = tmp_path / "merged"
+    save_merged_checkpoint(str(base_dir), m.state_dict(), str(out_dir))
+
+    # The sidecar + its companions must be present in the output.
+    for required in ("classifier_head.bin",
+                     "clone_detection_config.json",
+                     "best_metrics.json"):
+        assert (out_dir / required).exists(), f"{required} missing from merged output"
+
+    # And the reload path recognises the sidecar (not falls back to random).
+    import csv as _csv
+    csv_path = tmp_path / "e.csv"
+    with csv_path.open("w", newline="") as fh:
+        w = _csv.writer(fh); w.writerow(["code", "label"]); w.writerow(["x", "0"])
+    eval_fn = _build_architecture_eval_fn(
+        base_path=str(out_dir), resolved_eval_csv=str(csv_path),
+        limit=1, batch_size=1, max_length=8, device="cpu", task="clone_detection",
+    )
+    assert eval_fn.meta["uses_random_head"] is False
+    assert "sidecar" in eval_fn.meta["head_source"]

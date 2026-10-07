@@ -1213,17 +1213,27 @@ def save_merged_checkpoint(
     output_dir: str,
     prefer_safetensors: bool = True,
 ) -> str:
-    """Save merged weights + config + tokenizer (copied from base) to output_dir."""
+    """Save merged weights + config + tokenizer (copied from base) to output_dir.
+
+    When the base has a `classifier_head.bin` sidecar (the user's fine-tune
+    format), copy it alongside the merged encoder so the output can be
+    loaded + evaluated downstream without separately locating the head.
+    Previously the sidecar was consulted at merge time (to score candidates)
+    but dropped from the saved artifact, so a reload fell back to a random
+    classifier and silently gave garbage predictions.
+    """
     torch = _lazy_torch()
     transformers = _lazy_transformers()
+    import shutil
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     # Save config + tokenizer by re-loading from base path
-    cfg = transformers.AutoConfig.from_pretrained(_resolve_path(base_path))
+    resolved_base = _resolve_path(base_path)
+    cfg = transformers.AutoConfig.from_pretrained(resolved_base)
     cfg.save_pretrained(str(out))
     try:
-        tok = transformers.AutoTokenizer.from_pretrained(_resolve_path(base_path))
+        tok = transformers.AutoTokenizer.from_pretrained(resolved_base)
         tok.save_pretrained(str(out))
     except Exception as e:
         logger.warning(f"could not copy tokenizer from base ({e}); skipping")
@@ -1244,6 +1254,25 @@ def save_merged_checkpoint(
             pass
     if not saved:
         torch.save(state_dict, str(out / "pytorch_model.bin"))
+
+    # Carry over the base's task-specific sidecars (classifier_head.bin, the
+    # paired clone_detection_config.json, and best_metrics.json for audit).
+    # The merged state_dict holds the encoder; the sidecar holds the trained
+    # classifier that produced the scoring during an architecture merge. If
+    # we don't ship it, a reload scores against a random Linear.
+    base_dir = Path(resolved_base)
+    if base_dir.is_dir():
+        for sidecar in ("classifier_head.bin",
+                        "clone_detection_config.json",
+                        "best_metrics.json"):
+            src = base_dir / sidecar
+            if src.exists():
+                try:
+                    shutil.copy2(src, out / sidecar)
+                except OSError as e:
+                    logger.warning(
+                        f"could not copy sidecar {sidecar} to merged output: {e}"
+                    )
     return str(out)
 
 
