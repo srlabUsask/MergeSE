@@ -592,6 +592,35 @@ def _owns(dir_path: Path, owner: Optional[str]) -> bool:
     return _read_owner(dir_path) == owner
 
 
+def _safe_iterdir(root: Path):
+    """iterdir() that drops entries removed between listing and read.
+
+    Needed for concurrent list/delete workloads (retest P0-C): the outer
+    listing endpoints were calling `.stat()` or `.is_dir()` on each child
+    returned by iterdir(), which raced with concurrent `shutil.rmtree`
+    deletions and surfaced FileNotFoundError as a 500.
+    """
+    try:
+        return list(root.iterdir())
+    except FileNotFoundError:
+        return []
+
+
+def _safe_sorted_by_mtime(root: Path):
+    """`iterdir()` sorted by mtime desc, tolerant of races.
+
+    Entries that disappear between the iterdir snapshot and the stat() for
+    sort key get mtime=0 so they sort to the end, where the caller's own
+    stat/exists checks will drop them.
+    """
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except FileNotFoundError:
+            return 0.0
+    return sorted(_safe_iterdir(root), key=_mtime, reverse=True)
+
+
 # ---- model-reference resolution ---------------------------------------------
 
 # A single HF Hub path component (org or model name). Must start with an
@@ -1358,31 +1387,51 @@ def _kill_proc_group(proc: subprocess.Popen) -> None:
             continue
 
 
-def _tail_stream(job: Job):
-    """Generator yielding SSE messages by tailing the job's log file."""
-    # Wait for log file to exist briefly
-    for _ in range(50):
-        if job.log_path.exists():
-            break
-        time.sleep(0.05)
-    if not job.log_path.exists():
-        yield "event: error\ndata: log not available\n\n"
-        return
+# Retest finding P0-D: SSE log streams were occupying worker threads 1:1
+# with no cap, and sixteen concurrent streams against a 16-thread gthread
+# gunicorn exhausted ordinary request capacity (health probes timed out
+# with streams open). Cap concurrent streams at MAX_SSE_STREAMS so at least
+# two threads are always available for non-stream traffic; a cap hit returns
+# 429 so clients know to retry. Default headroom is `max(threads - 2, 2)`.
+_SSE_DEFAULT_CAP = max(
+    int(os.environ.get("GUNICORN_THREADS", "16")) - 2, 2
+)
+MAX_SSE_STREAMS = int(os.environ.get("MERGESE_MAX_SSE_STREAMS", str(_SSE_DEFAULT_CAP)))
+_SSE_SEM = threading.BoundedSemaphore(MAX_SSE_STREAMS)
 
-    with open(job.log_path, "rb") as f:
-        while True:
-            line = f.readline()
-            if line:
-                payload = line.decode("utf-8", errors="replace").rstrip("\n")
-                yield f"data: {json.dumps({'line': payload})}\n\n"
-                continue
-            # End of file - check job status
-            with JOBS_LOCK:
-                status = job.status
-            if status in ("done", "error", "cancelled"):
-                yield f"event: end\ndata: {json.dumps({'status': status, 'exit_code': job.exit_code})}\n\n"
-                return
-            time.sleep(0.2)
+
+def _tail_stream(job: Job):
+    """Generator yielding SSE messages by tailing the job's log file.
+
+    Wrap the body in a try/finally so a client disconnect (gunicorn closes the
+    generator) still releases the SSE slot.
+    """
+    try:
+        # Wait for log file to exist briefly
+        for _ in range(50):
+            if job.log_path.exists():
+                break
+            time.sleep(0.05)
+        if not job.log_path.exists():
+            yield "event: error\ndata: log not available\n\n"
+            return
+
+        with open(job.log_path, "rb") as f:
+            while True:
+                line = f.readline()
+                if line:
+                    payload = line.decode("utf-8", errors="replace").rstrip("\n")
+                    yield f"data: {json.dumps({'line': payload})}\n\n"
+                    continue
+                # End of file - check job status
+                with JOBS_LOCK:
+                    status = job.status
+                if status in ("done", "error", "cancelled"):
+                    yield f"event: end\ndata: {json.dumps({'status': status, 'exit_code': job.exit_code})}\n\n"
+                    return
+                time.sleep(0.2)
+    finally:
+        _SSE_SEM.release()
 
 
 # ---- Flask app ---------------------------------------------------------------
@@ -1708,9 +1757,21 @@ def api_job_stream(job_id: str):
     if not job:
         abort(404)
     _require_owner(job)
+    # P0-D: non-blocking semaphore acquire. If we're already serving the
+    # configured maximum number of streams, refuse with 429 so health probes
+    # and job submits keep working. Clients can retry (polling /api/jobs/<id>
+    # for status is the fallback) or wait and try again.
+    if not _SSE_SEM.acquire(blocking=False):
+        return jsonify({
+            "error": (f"too many open log streams on this instance "
+                      f"(cap: {MAX_SSE_STREAMS}); poll /api/jobs/{job_id} "
+                      f"or retry in a moment"),
+            "retry_after": 5,
+        }), 429
     return Response(_tail_stream(job), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
-                             "X-Accel-Buffering": "no"})
+                             "X-Accel-Buffering": "no",
+                             "Retry-After": "5"})
 
 
 @app.route("/api/jobs/<job_id>/result")
@@ -1992,7 +2053,21 @@ def api_upload():
             zip_path = d / "_upload.zip"
             f.save(str(zip_path))
             try:
-                with zipfile.ZipFile(zip_path) as zf:
+                try:
+                    zf = zipfile.ZipFile(zip_path)
+                except zipfile.BadZipFile as e:
+                    # Retest finding P0-B: malformed archives were falling
+                    # through to the generic Exception handler and surfacing
+                    # as HTTP 500. A broken client archive is a user error,
+                    # not a server error: return 400 with the specific reason.
+                    shutil.rmtree(d, ignore_errors=True)
+                    return jsonify({
+                        "error": f"malformed zip: {e}",
+                        "hint": "Re-create the archive. On macOS prefer "
+                                "`zip -r out.zip ckpt_dir` over Finder's "
+                                "'Compress' which embeds AppleDouble metadata.",
+                    }), 400
+                with zf:
                     err, extracted = _safe_zip_extract(zf, d)
                     if err:
                         shutil.rmtree(d, ignore_errors=True)
@@ -2088,20 +2163,30 @@ def api_library():
     out = {"uploads": [], "server": [], "jobs": [], "suggestions": [],
            "datasets": {"bundled": [], "uploads": [], "server": [], "suggestions": []}}
 
-    # uploads (scoped to caller)
-    if UPLOADS_ROOT.exists():
-        for d in sorted(UPLOADS_ROOT.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+    # uploads (scoped to caller). P0-C: iterate tolerantly - a concurrent
+    # delete on another thread can remove an entry between the iterdir()
+    # snapshot and the per-child stat() below.
+    for d in _safe_sorted_by_mtime(UPLOADS_ROOT):
+        try:
             if not d.is_dir() or not _owns(d, owner):
                 continue
             label_path = d / ".label"
             label = label_path.read_text().strip() if label_path.exists() else None
-            size = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
+            size = 0
+            for p in d.rglob("*"):
+                try:
+                    if p.is_file():
+                        size += p.stat().st_size
+                except FileNotFoundError:
+                    continue
             out["uploads"].append({
                 "ref": f"upload://{d.name}",
                 "label": label or d.name,
                 "size": size,
                 "mtime": d.stat().st_mtime,
             })
+        except FileNotFoundError:
+            continue
 
     # server-mounted (global; operator-provided, not user content)
     if CHECKPOINTS_ROOT:
@@ -2158,10 +2243,9 @@ def api_library():
             "description": b.get("description", ""),
         })
 
-    # Uploaded datasets (scoped to caller)
-    if DATASET_UPLOADS_ROOT.exists():
-        for d in sorted(DATASET_UPLOADS_ROOT.iterdir(),
-                        key=lambda x: x.stat().st_mtime, reverse=True):
+    # Uploaded datasets (scoped to caller). P0-C: see _safe_sorted_by_mtime.
+    for d in _safe_sorted_by_mtime(DATASET_UPLOADS_ROOT):
+        try:
             if not d.is_dir() or not _owns(d, owner):
                 continue
             csv = d / "data.csv"
@@ -2174,6 +2258,8 @@ def api_library():
                 "label": label,
                 "size": csv.stat().st_size,
             })
+        except FileNotFoundError:
+            continue
 
     # Admin-mounted CSVs (MERGESE_DATASETS)
     if DATASETS_ROOT:
@@ -2285,21 +2371,27 @@ def api_datasets_list():
     owner = _authenticate()
     items = []
     if DATASET_UPLOADS_ROOT.exists():
-        for d in sorted(DATASET_UPLOADS_ROOT.iterdir(),
-                        key=lambda x: x.stat().st_mtime, reverse=True):
+        # Retest finding P0-C: a concurrent DELETE could race with the sort
+        # key or the per-entry stat() below and surface FileNotFoundError as
+        # HTTP 500. The listing is a snapshot - a disappearing entry is a
+        # legitimate state (someone else just deleted it), not an error.
+        for d in _safe_sorted_by_mtime(DATASET_UPLOADS_ROOT):
             if not d.is_dir() or not _owns(d, owner):
                 continue
             csv = d / "data.csv"
-            if not csv.exists():
+            try:
+                if not csv.exists():
+                    continue
+                label_path = d / ".label"
+                label = label_path.read_text().strip() if label_path.exists() else d.name
+                items.append({
+                    "token": d.name,
+                    "ref": f"dataset://{d.name}",
+                    "label": label,
+                    "size": csv.stat().st_size,
+                })
+            except FileNotFoundError:
                 continue
-            label_path = d / ".label"
-            label = label_path.read_text().strip() if label_path.exists() else d.name
-            items.append({
-                "token": d.name,
-                "ref": f"dataset://{d.name}",
-                "label": label,
-                "size": csv.stat().st_size,
-            })
     return jsonify({"datasets": items, "bundled": _load_benchmarks_index().get("benchmarks", [])})
 
 
@@ -2321,20 +2413,30 @@ def api_uploads_list():
     owner = _authenticate()
     items = []
     if UPLOADS_ROOT.exists():
-        for d in sorted(UPLOADS_ROOT.iterdir()):
-            if not d.is_dir() or not _owns(d, owner):
+        # P0-C: tolerate concurrent deletes. See api_datasets_list for context.
+        for d in _safe_iterdir(UPLOADS_ROOT):
+            try:
+                if not d.is_dir() or not _owns(d, owner):
+                    continue
+                label_path = d / ".label"
+                label = label_path.read_text().strip() if label_path.exists() else None
+                size = 0
+                for p in d.rglob("*"):
+                    try:
+                        if p.is_file():
+                            size += p.stat().st_size
+                    except FileNotFoundError:
+                        continue
+                items.append({
+                    "token": d.name,
+                    "ref": f"upload://{d.name}",
+                    "size": size,
+                    "label": label,
+                    "mtime": d.stat().st_mtime,
+                    "files": sorted(p.name for p in d.iterdir() if p.is_file())[:32],
+                })
+            except FileNotFoundError:
                 continue
-            label_path = d / ".label"
-            label = label_path.read_text().strip() if label_path.exists() else None
-            size = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
-            items.append({
-                "token": d.name,
-                "ref": f"upload://{d.name}",
-                "size": size,
-                "label": label,
-                "mtime": d.stat().st_mtime,
-                "files": sorted(p.name for p in d.iterdir() if p.is_file())[:32],
-            })
     items.sort(key=lambda x: -x["mtime"])
     return jsonify({"uploads": items, "max_upload_bytes": MAX_UPLOAD_BYTES})
 
@@ -2363,6 +2465,23 @@ def api_job_download(job_id: str):
     if not job:
         abort(404)
     _require_owner(job)
+
+    # Retest finding P0-A: downloading a pending/running merge was returning
+    # HTTP 200 with an empty 22-byte zip (and then caching that empty archive
+    # for all subsequent downloads of the same job after it completed). The
+    # cause: this handler built _download.zip from whatever was in the artifact
+    # directory at request time, and `if not zip_path.exists()` reused that
+    # first (empty) build forever. We now (a) refuse downloads of non-complete
+    # jobs with 409, pointing the client at /api/jobs/<id> for polling, and
+    # (b) invalidate the cached zip if its mtime predates the job's
+    # finished_at, so a client that polled early and triggered the empty
+    # cache still gets a correct zip after completion.
+    if job.status != "done":
+        return jsonify({
+            "error": f"job is {job.status}; download is only available for completed jobs",
+            "status": job.status,
+            "job_id": job.id,
+        }), 409
 
     # Pick the right artifact directory:
     #   merge   -> artifacts/<id>/merged
@@ -2394,6 +2513,13 @@ def api_job_download(job_id: str):
     # the time any thread reads zip_path it is either absent or complete.
     zip_path = ARTIFACTS_ROOT / job_id / "_download.zip"
     with _get_download_lock(job_id):
+        # Invalidate a stale cached zip that was built before the job finished
+        # (e.g. by a prior race where the status check didn't exist). A fresh
+        # rebuild is cheap - ZIP_STORED just concatenates - and avoids forever
+        # serving the empty archive created by a premature download.
+        if zip_path.exists() and job.finished_at and \
+                zip_path.stat().st_mtime < job.finished_at:
+            zip_path.unlink(missing_ok=True)
         if not zip_path.exists():
             tmp = zip_path.with_suffix(".zip.inflight")
             tmp.unlink(missing_ok=True)
