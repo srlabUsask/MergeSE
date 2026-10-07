@@ -1811,7 +1811,37 @@ def cmd_export(ctx: click.Context, model_path: str, fmt: str, output: str,
         tok = transformers.AutoTokenizer.from_pretrained(resolved)
         dummy = tok("def add(a,b): return a+b", return_tensors="pt", padding="max_length",
                     truncation=True, max_length=max_length)
-        traced = torch.jit.trace(model, (dummy["input_ids"], dummy["attention_mask"]))
+
+        # torch.jit.trace refuses dict-shaped outputs ("Encountering a dict at
+        # the output of the tracer might cause the trace to be incorrect").
+        # Modern transformers return ModelOutput subclasses (dict-like) by
+        # default, so wrap the model in a Module whose forward returns a plain
+        # tensor: logits for a classification head, last_hidden_state otherwise.
+        class _TraceWrapper(torch.nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+            def forward(self, input_ids, attention_mask):
+                out = self.inner(input_ids=input_ids, attention_mask=attention_mask,
+                                 return_dict=False)
+                # return_dict=False gives a tuple; the first element is the
+                # primary tensor (logits for classification, last_hidden_state
+                # for a bare encoder). This is the trace-safe path.
+                if isinstance(out, (tuple, list)):
+                    return out[0]
+                if hasattr(out, "logits"):
+                    return out.logits
+                if hasattr(out, "last_hidden_state"):
+                    return out.last_hidden_state
+                return out
+
+        wrapper = _TraceWrapper(model).eval()
+        with torch.no_grad():
+            traced = torch.jit.trace(
+                wrapper,
+                (dummy["input_ids"], dummy["attention_mask"]),
+                strict=False,
+            )
         traced.save(str(out))
         size = out.stat().st_size
     else:
