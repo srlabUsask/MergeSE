@@ -542,3 +542,122 @@ def test_architecture_merge_detects_encoder_layout():
     import pytest
     with pytest.raises(ValueError, match="encoder.layer"):
         _encoder_layer_prefixes(["no.such.pattern.0"])
+
+
+# ---- architecture-merge retest findings (A1, A2, A3) -----------------------
+
+_transformers_ok = False
+try:
+    import transformers as _tx  # noqa: F401
+    _transformers_ok = True
+except Exception:
+    _transformers_ok = False
+
+_needs_transformers = pytest.mark.skipif(
+    not _transformers_ok,
+    reason="transformers unavailable in this environment",
+)
+
+
+@_needs_transformers
+def test_build_architecture_eval_fn_accepts_task(monkeypatch, tmp_path):
+    """A1: `--task clone_detection` previously NameError'd on `_REGISTRY`
+    because mergese.py imports the registry under a different name. Pin
+    that supplying a valid task name reaches the metric-mode logic
+    without crashing. We mock out the heavy transformers path and just
+    exercise the branch that failed."""
+    import csv as _csv, torch
+    from mergese import _build_architecture_eval_fn
+    # Build a 2-row CSV so the empty-dataset check passes.
+    csv_path = tmp_path / "e.csv"
+    with csv_path.open("w", newline="") as fh:
+        w = _csv.writer(fh); w.writerow(["code", "label"])
+        w.writerow(["x", "0"]); w.writerow(["y", "1"])
+    # Stub a tiny bare encoder so we don't need a real HF checkpoint.
+    import mergese
+    base_dir = tmp_path / "base"; base_dir.mkdir()
+    # Save a minimal BertModel so AutoModel.from_pretrained works.
+    from transformers import BertConfig, BertModel, BertTokenizerFast
+    cfg = BertConfig(vocab_size=50, hidden_size=16, num_hidden_layers=1,
+                     num_attention_heads=2, intermediate_size=32,
+                     max_position_embeddings=16)
+    m = BertModel(cfg)
+    for p in m.parameters(): p.data = p.data.contiguous()
+    m.save_pretrained(base_dir, safe_serialization=True)
+    vocab = {"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,
+             **{f"t{i}":i+5 for i in range(40)}}
+    (base_dir / "vocab.txt").write_text("\n".join(vocab))
+    BertTokenizerFast(vocab_file=str(base_dir / "vocab.txt")).save_pretrained(base_dir)
+    # A task argument must not NameError.
+    eval_fn = _build_architecture_eval_fn(
+        base_path=str(base_dir), resolved_eval_csv=str(csv_path),
+        limit=2, batch_size=1, max_length=8, device="cpu",
+        task="clone_detection",
+    )
+    # Can score the base's own state dict (no key mismatch).
+    import transformers
+    base_sd = transformers.AutoModel.from_pretrained(str(base_dir)).state_dict()
+    score = eval_fn(base_sd)
+    assert 0.0 <= float(score) <= 1.0
+
+
+@_needs_transformers
+def test_architecture_eval_fn_rejects_empty_eval_csv(monkeypatch, tmp_path):
+    """A3: a CSV with only the header previously produced a successful merge
+    with zero scored examples. Reject at eval-fn build time."""
+    import csv as _csv, click
+    from mergese import _build_architecture_eval_fn
+    csv_path = tmp_path / "empty.csv"
+    with csv_path.open("w", newline="") as fh:
+        _csv.writer(fh).writerow(["code", "label"])  # header only
+    base_dir = tmp_path / "base"; base_dir.mkdir()
+    from transformers import BertConfig, BertModel, BertTokenizerFast
+    cfg = BertConfig(vocab_size=50, hidden_size=16, num_hidden_layers=1,
+                     num_attention_heads=2, intermediate_size=32,
+                     max_position_embeddings=16)
+    m = BertModel(cfg)
+    for p in m.parameters(): p.data = p.data.contiguous()
+    m.save_pretrained(base_dir, safe_serialization=True)
+    (base_dir / "vocab.txt").write_text("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\n")
+    BertTokenizerFast(vocab_file=str(base_dir / "vocab.txt")).save_pretrained(base_dir)
+    with pytest.raises(click.UsageError, match="empty"):
+        _build_architecture_eval_fn(
+            base_path=str(base_dir), resolved_eval_csv=str(csv_path),
+            limit=200, batch_size=4, max_length=16, device="cpu", task="",
+        )
+
+
+@_needs_transformers
+def test_architecture_eval_fn_strict_rejects_wrong_layout(monkeypatch, tmp_path):
+    """A2: previously strict=False silently discarded all encoder weights
+    whose keys didn't match the shell (bare-encoder merged_sd vs
+    classification-head shell with `bert.encoder.` prefix). Now strict=True
+    raises so the hill climb never silently scores identical copies of the
+    base."""
+    import csv as _csv, torch
+    from mergese import _build_architecture_eval_fn
+    csv_path = tmp_path / "e.csv"
+    with csv_path.open("w", newline="") as fh:
+        w = _csv.writer(fh); w.writerow(["code", "label"]); w.writerow(["x", "0"])
+    base_dir = tmp_path / "base"; base_dir.mkdir()
+    from transformers import BertConfig, BertModel, BertTokenizerFast
+    cfg = BertConfig(vocab_size=50, hidden_size=16, num_hidden_layers=1,
+                     num_attention_heads=2, intermediate_size=32,
+                     max_position_embeddings=16)
+    m = BertModel(cfg)
+    for p in m.parameters(): p.data = p.data.contiguous()
+    m.save_pretrained(base_dir, safe_serialization=True)
+    (base_dir / "vocab.txt").write_text("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\n")
+    BertTokenizerFast(vocab_file=str(base_dir / "vocab.txt")).save_pretrained(base_dir)
+    eval_fn = _build_architecture_eval_fn(
+        base_path=str(base_dir), resolved_eval_csv=str(csv_path),
+        limit=1, batch_size=1, max_length=8, device="cpu", task="",
+    )
+    # A sabotaged state_dict with an obviously-wrong prefix. strict=True
+    # should raise RuntimeError inside load_state_dict rather than quietly
+    # ignoring it.
+    bad_sd = {f"bert.{k}": v for k, v in
+              __import__("transformers").AutoModel.from_pretrained(str(base_dir))
+              .state_dict().items()}
+    with pytest.raises(RuntimeError):
+        eval_fn(bad_sd)

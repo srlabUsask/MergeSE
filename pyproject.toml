@@ -123,16 +123,19 @@ extend-exclude = [
 # F4  -> import issues (F401 unused, F403 star-import, F405 undefined-from-star)
 # F6  -> literal + redefinition bugs (F601, F602, F621, ...)
 # F7  -> syntax issues python flagged (F701, F702, ...)
-# F81 -> F811 only (redefinition of unused name)
+# F8  -> F811 redefinition, F821 undefined-name, F841 unused variable
 # F9  -> boolean/if/assignment smells
 # W6  -> deprecated syntax (invalid escape sequences etc)
 # S102, S106, S108 -> exec / hard-coded password / /tmp paths (not S110 bare-pass:
 #        the project uses OSError-swallow pattern deliberately)
 #
-# F821 (undefined-name) is OFF because mergese.py uses a lazy-import pattern
-# (`torch = _lazy_torch()`) that ruff can't follow without a type stub.
+# F821 was previously disabled because mergese.py uses `torch = _lazy_torch()`
+# and ruff couldn't resolve `"torch.Tensor"` string annotations - which hid a
+# real `_REGISTRY` undefined-name bug that only surfaced via a 3rd-party
+# audit. The TYPE_CHECKING import block in mergese.py now exposes `torch` to
+# ruff without eager-loading at runtime, so F821 is safe to enable.
 # B (bugbear) is OFF for now to keep the first-day CI green; graduate later.
-select = ["E9", "F4", "F6", "F7", "F81", "F9", "W6", "S102", "S106", "S108"]
+select = ["E9", "F4", "F6", "F7", "F8", "F9", "W6", "S102", "S106", "S108"]
 ignore = []
 
 [tool.ruff.lint.per-file-ignores]
