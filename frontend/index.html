@@ -51,6 +51,11 @@
       <div class="subtitle">Post-hoc model merging for software engineering</div>
     </div>
   </div>
+  <!-- Below 600px the full menu collapses behind this toggle (CSS). The
+       details element gives us a native disclosure with no JavaScript. -->
+  <details class="nav-mobile">
+    <summary aria-label="Open menu">Menu</summary>
+  </details>
   <nav>
     <a href="#library">Library</a>
     <a href="#inspect">Inspect</a>
@@ -63,6 +68,12 @@
       <span class="spin"></span>
       <span id="runningPillText">0 running</span>
     </a>
+    <a href="https://github.com/srlabUsask/MergeSE/issues/new?template=bug_report.md"
+       target="_blank" rel="noopener" class="nav-util"
+       title="Open a GitHub issue; please include the job id if applicable">Report issue</a>
+    <a href="mailto:palash.roy101@gmail.com?subject=MergeSE%20API%20access%20request&body=Which%20tier%20do%20you%20need%2C%20and%20what%20will%20you%20use%20it%20for%3F"
+       class="nav-util"
+       title="Email the maintainer with your use case and expected volume">Request API access</a>
     <a href="https://github.com/srlabUsask/MergeSE" id="ghLink" class="gh-link" target="_blank" rel="noopener">GitHub</a>
   </nav>
 </header>
@@ -73,24 +84,45 @@
     <div class="hero-text">
       <h1>Merge fine-tuned SE models <span class="grad">without retraining</span>.</h1>
       <p class="lead">
-        TIES / DARE-TIES / averaging on any HuggingFace encoder - for
+        TIES / DARE-TIES / WUDI / PCB / task-vector averaging on
+        BERT &amp; RoBERTa-family encoders from the HuggingFace Hub &mdash; for
         <strong>clone detection</strong>, <strong>vulnerability detection</strong>,
         <strong>defect prediction</strong>, <strong>code-smell</strong>,
         <strong>commit classification</strong> and more. One CLI, one web tool;
-        no retraining, no labels. Built alongside our ASE submission.
+        no retraining, no labels for the parameter-level methods.
+        <em>Architecture merging</em> (greedy) uses a small validation slice
+        to hill-climb layer swaps.
       </p>
       <div class="hero-cta">
         <a class="btn btn-primary" href="#merge">Try a merge</a>
         <a class="btn btn-ghost" href="#docs">Read the docs</a>
+        <a class="btn btn-ghost" href="https://github.com/srlabUsask/MergeSE/issues/new?template=bug_report.md"
+           target="_blank" rel="noopener">Report an issue</a>
       </div>
       <div class="status-line" id="healthLine">
         <span class="dot pulse"></span>
         <span id="healthText">connecting to backend...</span>
       </div>
+      <!-- Research credibility strip. Updated per release so reviewers can
+           cite exact state. If you touch the version or paper link, update
+           it in server/app.py's /api/health response too. -->
+      <div class="credits">
+        <span class="credits-item"><strong>Paper:</strong> ASE 2026 Tool Track
+          &mdash;
+          <a href="https://github.com/srlabUsask/MergeSE/blob/main/CITATION.cff"
+             target="_blank" rel="noopener">cite</a></span>
+        <span class="credits-item"><strong>Code:</strong>
+          <a href="https://github.com/srlabUsask/MergeSE"
+             target="_blank" rel="noopener">srlabUsask/MergeSE</a></span>
+        <span class="credits-item"><strong>Maintainer:</strong>
+          <a href="mailto:palash.roy101@gmail.com">Palash R. Roy</a> &mdash;
+          University of Saskatchewan</span>
+        <span class="credits-item" id="versionPill" title="Live backend version"></span>
+      </div>
     </div>
     <div class="hero-card">
       <div class="codecard">
-        <div class="codecard-head"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="cc-title">terminal</span></div>
+        <div class="codecard-head"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="cc-title">terminal &mdash; illustrative, not a live run</span></div>
 <pre><code><span class="prompt">$</span> mergese inspect <span class="arg">microsoft/codebert-base</span> \
                   <span class="arg">microsoft/graphcodebert-base</span> \
                   --base <span class="arg">microsoft/codebert-base</span>
