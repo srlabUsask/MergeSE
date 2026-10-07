@@ -251,16 +251,25 @@ AUTH_DB = Path(os.environ.get("MERGESE_AUTH_DB", str(ARTIFACTS_ROOT / "_auth" / 
 ANON_TTL_SEC = int(os.environ.get("MERGESE_ANON_TTL_SEC", "86400"))
 
 _AUTH = None  # lazily created AuthStore
+_AUTH_INIT_LOCK = threading.Lock()
 
 
 def _auth_store():
+    # Double-checked lock. Without this, two concurrent requests on the first
+    # authenticated hit each try to open the SQLite file at the same time,
+    # and the second observes a half-initialised schema (table-not-found
+    # errors / "no such table"). The read outside the lock is a cheap fast
+    # path for the common case where _AUTH is already populated.
     global _AUTH
-    if _AUTH is None:
-        import auth as _authmod
-        secret = _authmod.load_secret(
-            os.environ.get("MERGESE_AUTH_SECRET"),
-            AUTH_DB.parent / "signing.secret")
-        _AUTH = _authmod.AuthStore(AUTH_DB, secret, anon_ttl_sec=ANON_TTL_SEC)
+    if _AUTH is not None:
+        return _AUTH
+    with _AUTH_INIT_LOCK:
+        if _AUTH is None:
+            import auth as _authmod
+            secret = _authmod.load_secret(
+                os.environ.get("MERGESE_AUTH_SECRET"),
+                AUTH_DB.parent / "signing.secret")
+            _AUTH = _authmod.AuthStore(AUTH_DB, secret, anon_ttl_sec=ANON_TTL_SEC)
     return _AUTH
 
 
@@ -318,6 +327,20 @@ class Job:
 
 JOBS: Dict[str, Job] = {}
 JOBS_LOCK = threading.Lock()
+
+# Per-job locks for serialising the download-zip build. Keyed by job_id so
+# concurrent first-downloads of DIFFERENT jobs don't block each other.
+_DOWNLOAD_LOCKS: Dict[str, threading.Lock] = {}
+_DOWNLOAD_LOCKS_LOCK = threading.Lock()
+
+
+def _get_download_lock(job_id: str) -> threading.Lock:
+    with _DOWNLOAD_LOCKS_LOCK:
+        lock = _DOWNLOAD_LOCKS.get(job_id)
+        if lock is None:
+            lock = threading.Lock()
+            _DOWNLOAD_LOCKS[job_id] = lock
+        return lock
 JOB_PROCS: Dict[str, subprocess.Popen] = {}
 RUN_SEMA = threading.BoundedSemaphore(MAX_CONCURRENT)
 
@@ -329,7 +352,15 @@ def _inflight_jobs() -> int:
 
 
 def _capacity_response():
-    """Return a 429 response tuple when the job queue is saturated, else None."""
+    """Return a 429 response tuple when the job queue is saturated, else None.
+
+    DEPRECATED: this is the two-step check-then-insert pattern that races
+    itself under concurrency (multiple requests pass the check before any
+    register). New endpoint code should call `_admit_job(...)` instead, which
+    folds the capacity + per-user + daily-quota checks and the JOBS insert
+    into one critical section. Kept here only so old endpoint code paths
+    that haven't been migrated still function - but it IS NOT race-free.
+    """
     if _inflight_jobs() >= MAX_QUEUE:
         return jsonify({
             "error": "server is at capacity; too many jobs are queued or running",
@@ -337,6 +368,90 @@ def _capacity_response():
             "retry_after_sec": 30,
         }), 429
     return None
+
+
+class _CapacityError(Exception):
+    """Raised by `_admit_job` when queue or per-user limits are hit."""
+    def __init__(self, status: int, message: str, extra: Optional[dict] = None):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.extra = extra or {}
+
+
+def _admit_job(owner: Optional[str] = None, kind: str = "pending") -> Tuple[str, Path]:
+    """Atomic admission: check global queue + per-user active-slot limits +
+    daily quota, allocate a job id, reserve the artifact dir on disk, insert
+    a placeholder Job into JOBS, and return (job_id, job_dir).
+
+    `owner`, when provided, authoritatively stamps the placeholder. When
+    omitted, we derive it from the authenticated client in this request
+    context. The two must agree if both are present - otherwise the per-user
+    check would reference the wrong identity under racing admissions.
+
+    Why this exists: the previous flow (`_capacity_response()` → resolve refs →
+    `_reserve_job_quota()` → `_allocate_job_id()` → `_new_job(... insert)`) had
+    N concurrent requests each read a stale inflight count, pass the check,
+    then all insert. The queue could overshoot by 50%+. Likewise the per-user
+    active-slot check could overshoot. Fold the global + per-user checks and
+    the JOBS insert into one critical section.
+    """
+    client = _resolve_client()   # may raise AuthError 401 — outside the lock
+    if client is not None:
+        if owner is None:
+            owner = client.client_id
+        elif owner != client.client_id:
+            # Should never happen: the caller derived `owner` from the same
+            # _authenticate() this request already did. If they diverge, the
+            # per-user check below would be checking the wrong identity.
+            raise _CapacityError(500, "owner mismatch between caller and auth")
+    reserved_quota = False
+    if client is not None:
+        # Daily-budget reservation lives in SQLite (AuthStore). Count the
+        # per-user active jobs from a snapshot; the authoritative check
+        # happens again inside JOBS_LOCK below so a race here is harmless.
+        _auth_store().check_and_reserve(client, active_jobs=0)
+        reserved_quota = True
+    try:
+        with JOBS_LOCK:
+            # 1. Global queue
+            inflight = sum(1 for j in JOBS.values()
+                           if j.status in ("pending", "running"))
+            if inflight >= MAX_QUEUE:
+                raise _CapacityError(
+                    429, "server at capacity; too many jobs queued or running",
+                    extra={"max_queue": MAX_QUEUE, "retry_after_sec": 30},
+                )
+            # 2. Per-user active-slot cap (JOBS truth, not the snapshot auth saw)
+            if client is not None:
+                active = sum(1 for j in JOBS.values()
+                             if j.owner == client.client_id
+                             and j.status in ("pending", "running"))
+                if active >= client.tier.max_active:
+                    raise _CapacityError(
+                        429, f"you already have {active} active job(s); "
+                             f"limit is {client.tier.max_active}",
+                    )
+            # 3. Allocate + reserve by inserting a placeholder other threads see.
+            job_id = uuid.uuid4().hex[:12]
+            job_dir = ARTIFACTS_ROOT / job_id
+            job_dir.mkdir(parents=True, exist_ok=True)
+            JOBS[job_id] = Job(
+                id=job_id, cmd=[], kind=kind,
+                log_path=job_dir / "log.txt",
+                owner=owner,
+            )
+    except _CapacityError:
+        # Give the daily budget back - we charged for a job we never admitted.
+        if reserved_quota:
+            try:
+                _auth_store().release_reservation(client)
+            except Exception:
+                import logging as _lg
+                _lg.getLogger("mergese").exception(
+                    "release_reservation failed; one daily slot leaked")
+        raise
+    return job_id, job_dir
 
 
 # ---- authentication middleware ----------------------------------------------
@@ -870,8 +985,16 @@ def _new_job(kind: str, cli_args: List[str], params: dict,
              result_basename: Optional[str] = None,
              job_id: Optional[str] = None,
              owner: Optional[str] = None) -> Job:
+    """Finalize a Job and launch its worker thread.
+
+    When `job_id` is given (the normal path now), we expect a placeholder
+    already in JOBS from a prior `_admit_job()` call - this call updates it
+    in place with the real cmd + metadata. When `job_id` is None we admit
+    and finalize in one step for backwards compatibility with any caller
+    that hasn't been migrated to `_admit_job` yet.
+    """
     if job_id is None:
-        job_id, job_dir = _allocate_job_id()
+        job_id, job_dir = _admit_job(owner, kind=kind)
     else:
         job_dir = ARTIFACTS_ROOT / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -1344,20 +1467,20 @@ def api_inspect():
     body = _json_body()
     models = _field_str_list(body, "models", min_items=2)
     base = _field_str(body, "base")
-    over = _capacity_response()
-    if over:
-        return over
     try:
         resolved_models = [resolve_model_ref(m, owner=owner) for m in models]
         resolved_base = resolve_model_ref(base, owner=owner) if base else None
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    _reserve_job_quota()
+    # Atomic admission - avoids the race where N concurrent requests pass the
+    # capacity check before any inserts into JOBS.
+    job_id, _ = _admit_job(owner, kind="inspect")
     args = ["inspect", *resolved_models]
     if resolved_base:
         args.extend(["--base", resolved_base])
     job = _new_job("inspect", args, {"models": models, "base": base},
-                   result_basename="report.json", owner=owner)
+                   result_basename="report.json",
+                   job_id=job_id, owner=owner)
     return jsonify({"job_id": job.id, "status": job.status}), 202
 
 
@@ -1396,9 +1519,6 @@ def api_merge():
                      "greedy layer stitching uses a small validation slice to "
                      "score each candidate layer swap."
         }), 400
-    over = _capacity_response()
-    if over:
-        return over
 
     try:
         resolved_models = [resolve_model_ref(m, owner=owner) for m in models]
@@ -1409,8 +1529,7 @@ def api_merge():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    _reserve_job_quota()
-    job_id, job_dir = _allocate_job_id()
+    job_id, job_dir = _admit_job(owner, kind="merge")
     _write_owner(job_dir, owner)
     out_dir = job_dir / "merged"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1465,9 +1584,6 @@ def api_evaluate():
     max_length = _field_number(body, "max_length", default=512, min_value=1, max_value=16384, as_int=True)
     limit = _field_number(body, "limit", default=0, min_value=0, max_value=10 ** 9, as_int=True)
     metric = _field_enum(body, "metric", ("auto", "binary", "macro"), default="auto")
-    over = _capacity_response()
-    if over:
-        return over
 
     try:
         resolved_model = resolve_model_ref(model, owner=owner)
@@ -1496,8 +1612,9 @@ def api_evaluate():
         if test_file:
             args.extend(["--test-file", test_file])
 
-    _reserve_job_quota()
-    job = _new_job("evaluate", args, body, result_basename="metrics.json", owner=owner)
+    job_id, _ = _admit_job(owner, kind="evaluate")
+    job = _new_job("evaluate", args, body, result_basename="metrics.json",
+                   job_id=job_id, owner=owner)
     return jsonify({"job_id": job.id, "status": job.status}), 202
 
 
@@ -1511,17 +1628,13 @@ def api_export():
     fmt = _field_enum(body, "format",
                       ("huggingface", "onnx", "torchscript"),
                       default="huggingface")
-    over = _capacity_response()
-    if over:
-        return over
 
     try:
         resolved_model = resolve_model_ref(model, owner=owner)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    _reserve_job_quota()
-    job_id, base_out = _allocate_job_id()
+    job_id, base_out = _admit_job(owner, kind="export")
     _write_owner(base_out, owner)
     if fmt == "huggingface":
         out_path = base_out / "exported"
@@ -2253,21 +2366,26 @@ def api_job_download(job_id: str):
 
     archive_name = f"mergese-{job.kind}-{job_id}.zip"
 
-    # Build the zip on disk under the job's artifact dir (reusing an existing
-    # one when present), then stream the bytes back. Building it incrementally
-    # in memory would corrupt the archive, since zipfile's central-directory
-    # offsets don't track buffer truncation between yields.
+    # P1-B fix: build the zip to a sibling .inflight file under a per-job
+    # lock, then os.replace() into the final path. Without this, concurrent
+    # first-download requests saw the zip half-written and streamed empty /
+    # partial archives with HTTP 200. os.replace is atomic on POSIX, so by
+    # the time any thread reads zip_path it is either absent or complete.
     zip_path = ARTIFACTS_ROOT / job_id / "_download.zip"
-    if not zip_path.exists():
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED,
-                             allowZip64=True) as zf:
-            if target.is_file():
-                zf.write(target, arcname=target.name)
-            else:
-                for f in sorted(target.rglob("*")):
-                    if not f.is_file() or f.name == "_download.zip":
-                        continue
-                    zf.write(f, arcname=f.relative_to(target).as_posix())
+    with _get_download_lock(job_id):
+        if not zip_path.exists():
+            tmp = zip_path.with_suffix(".zip.inflight")
+            tmp.unlink(missing_ok=True)
+            with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED,
+                                 allowZip64=True) as zf:
+                if target.is_file():
+                    zf.write(target, arcname=target.name)
+                else:
+                    for f in sorted(target.rglob("*")):
+                        if not f.is_file() or f.name in ("_download.zip", "_download.zip.inflight"):
+                            continue
+                        zf.write(f, arcname=f.relative_to(target).as_posix())
+            os.replace(tmp, zip_path)
 
     def stream_file():
         with open(zip_path, "rb") as fh:
@@ -2448,6 +2566,12 @@ def _register_auth_error_handler():
     @app.errorhandler(_authmod.AuthError)
     def _auth_error(e):  # noqa: ANN001
         return jsonify({"error": e.message}), e.status
+
+    @app.errorhandler(_CapacityError)
+    def _cap_error(e):  # noqa: ANN001
+        body = {"error": e.message}
+        body.update(e.extra)
+        return jsonify(body), e.status
 
 
 _register_auth_error_handler()

@@ -404,3 +404,149 @@ def test_number_fields_reject_nan_and_inf(monkeypatch, tmp_path):
                     content_type="application/json")
     assert r.status_code == 400
     assert "integer" in r.get_json()["error"].lower()
+
+
+# ---- concurrency hardening (external pressure-test findings) ---------------
+
+def test_atomic_admission_respects_queue_cap(monkeypatch, tmp_path):
+    """P1-C: _capacity_response + _reserve + _new_job wasn't atomic, so N
+    concurrent requests all passed the capacity check before any inserted.
+    `_admit_job` folds those into one critical section; the queue cap must
+    now hold under racing admissions."""
+    import threading
+    app = _load_app(monkeypatch, tmp_path,
+                    MERGESE_MAX_CONCURRENT="2",
+                    MERGESE_MAX_QUEUE="4")
+    admitted, rejected = [], []
+    errors = []
+
+    def _one():
+        try:
+            jid, _ = app._admit_job(owner=None, kind="pending")
+            admitted.append(jid)
+        except app._CapacityError:
+            rejected.append(1)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=_one) for _ in range(20)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert not errors, f"unexpected exceptions: {errors}"
+    assert len(admitted) == 4, f"queue cap=4; got {len(admitted)} admitted"
+    assert len(admitted) + len(rejected) == 20
+
+
+def test_atomic_admission_respects_per_user_cap(monkeypatch, tmp_path):
+    """P2: per-user active-slot limit raced the JOBS insert, so one key could
+    overshoot its tier.max_active (observed 7/3 under pressure). Atomic
+    admission must hold the cap per owner."""
+    import threading
+    app = _load_app(monkeypatch, tmp_path,
+                    MERGESE_REQUIRE_AUTH="1",
+                    MERGESE_AUTH_DB=str(tmp_path / "auth.db"),
+                    MERGESE_AUTH_SECRET="test-secret",
+                    MERGESE_ANON_MAX_ACTIVE="3",
+                    MERGESE_KEY_MAX_ACTIVE="3",
+                    MERGESE_KEY_DAILY_JOBS="1000",
+                    MERGESE_MAX_QUEUE="100")
+
+    store = app._auth_store()
+    _cid, key = store.mint_key(email="alice@local")
+
+    admitted, rejected = [], []
+    errors = []
+
+    def _one():
+        with app.app.test_request_context(
+                headers={"Authorization": f"Bearer {key}"}):
+            try:
+                jid, _ = app._admit_job(owner=None, kind="pending")
+                admitted.append(jid)
+            except app._CapacityError:
+                rejected.append(1)
+            except Exception as e:
+                errors.append(e)
+
+    threads = [threading.Thread(target=_one) for _ in range(16)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert not errors, f"unexpected exceptions: {errors}"
+    assert len(admitted) == 3, (
+        f"KEY_MAX_ACTIVE=3; one key got {len(admitted)} slots")
+
+
+def test_auth_store_sqlite_access_is_serialised(monkeypatch, tmp_path):
+    """P1-A: concurrent reads on the shared sqlite3 connection surfaced as
+    intermittent 401 + sqlite3.InterfaceError. Hammer _client_from_key from
+    many threads with a known-good key; every call must succeed."""
+    import threading
+    app = _load_app(monkeypatch, tmp_path,
+                    MERGESE_REQUIRE_AUTH="1",
+                    MERGESE_AUTH_DB=str(tmp_path / "auth.db"),
+                    MERGESE_AUTH_SECRET="test-secret")
+    import auth as _authmod
+    store = app._auth_store()
+    _cid, key = store.mint_key(email="alice@local")
+
+    bad, errs = [], []
+    def _hit():
+        try:
+            c = store.authenticate(api_key=key, anon_token=None)
+            if c.client_id != _cid: bad.append(c.client_id)
+        except _authmod.AuthError:
+            bad.append("autherror")
+        except Exception as e:
+            errs.append(e)
+
+    threads = [threading.Thread(target=_hit) for _ in range(64)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert not errs, f"sqlite3 raised under concurrency: {errs}"
+    assert not bad, f"{len(bad)} valid-key calls failed under concurrency"
+
+
+def test_download_zip_build_is_atomic(monkeypatch, tmp_path):
+    """P1-B: the download handler built _download.zip at the final path, so
+    concurrent requests could stream a half-written file. Build to .inflight
+    + os.replace means every reader sees either absent or complete."""
+    import threading, zipfile
+    app = _load_app(monkeypatch, tmp_path)
+    # Fake a merge job with a 'merged' dir containing a few files.
+    jid = "concur123abc"
+    jroot = app.ARTIFACTS_ROOT / jid
+    merged = jroot / "merged"
+    merged.mkdir(parents=True)
+    for i in range(4):
+        (merged / f"part{i}.bin").write_bytes(b"X" * 1024)
+    (merged / "config.json").write_text("{}")
+
+    # Simulate a merge job in JOBS so the handler finds the artifact.
+    job = app.Job(id=jid, cmd=["/bin/true"], kind="merge",
+                  log_path=jroot / "log.txt")
+    job.status = "done"
+    with app.JOBS_LOCK:
+        app.JOBS[jid] = job
+
+    client = app.app.test_client()
+    sizes = []
+    errs = []
+
+    def _grab():
+        try:
+            r = client.get(f"/api/jobs/{jid}/download")
+            # Load entire body (test client allows this safely).
+            data = r.get_data()
+            sizes.append(len(data))
+            with zipfile.ZipFile(__import__("io").BytesIO(data)) as zf:
+                assert len(zf.namelist()) == 5, zf.namelist()
+        except Exception as e:
+            errs.append(e)
+
+    threads = [threading.Thread(target=_grab) for _ in range(16)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert not errs, f"download thread errors: {errs}"
+    # Every zip opened cleanly with 5 entries; by that point the sizes should
+    # all match too (one atomic build, 16 reads of the same file).
+    assert len(set(sizes)) == 1, f"zip sizes diverge: {set(sizes)}"
