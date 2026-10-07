@@ -82,10 +82,14 @@
 
   <section class="hero">
     <div class="hero-text">
-      <h1>Merge fine-tuned SE models <span class="grad">without retraining</span>.</h1>
+      <!-- Period inside the span: on narrow screens the title can wrap at
+           "without / retraining." If the period sits outside the span it
+           risks being orphaned onto its own line. Keeping it inside also
+           keeps the full phrase styled as one gradient block. -->
+      <h1>Merge fine-tuned SE models <span class="grad">without retraining.</span></h1>
       <p class="lead">
-        TIES / DARE-TIES / WUDI / PCB / task-vector averaging on
-        BERT &amp; RoBERTa-family encoders from the HuggingFace Hub &mdash; for
+        TIES, DARE-TIES, WUDI, PCB and task-vector averaging on
+        BERT and RoBERTa-family encoders from the HuggingFace Hub. Supports
         <strong>clone detection</strong>, <strong>vulnerability detection</strong>,
         <strong>defect prediction</strong>, <strong>code-smell</strong>,
         <strong>commit classification</strong> and more. One CLI, one web tool;
@@ -109,22 +113,22 @@
       <div class="credits">
         <span class="credits-item"><strong>Paper:</strong>
           <a href="https://arxiv.org/abs/2608.04181"
-             target="_blank" rel="noopener">arXiv:2608.04181</a>
-          &mdash; ASE 2026 Tool Track
+             target="_blank" rel="noopener">arXiv:2608.04181</a>,
+          ASE 2026 Tool Track
           (<a href="https://github.com/srlabUsask/MergeSE/blob/main/CITATION.cff"
               target="_blank" rel="noopener">cite</a>)</span>
         <span class="credits-item"><strong>Code:</strong>
           <a href="https://github.com/srlabUsask/MergeSE"
              target="_blank" rel="noopener">srlabUsask/MergeSE</a></span>
         <span class="credits-item"><strong>Maintainer:</strong>
-          <a href="mailto:palash.roy101@gmail.com">Palash R. Roy</a> &mdash;
+          <a href="mailto:palash.roy101@gmail.com">Palash R. Roy</a>,
           University of Saskatchewan</span>
         <span class="credits-item" id="versionPill" title="Live backend version"></span>
       </div>
     </div>
     <div class="hero-card">
       <div class="codecard">
-        <div class="codecard-head"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="cc-title">terminal &mdash; illustrative, not a live run</span></div>
+        <div class="codecard-head"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="cc-title">terminal (illustrative, not a live run)</span></div>
 <pre><code><span class="prompt">$</span> mergese inspect <span class="arg">microsoft/codebert-base</span> \
                   <span class="arg">microsoft/graphcodebert-base</span> \
                   --base <span class="arg">microsoft/codebert-base</span>

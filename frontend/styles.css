@@ -126,6 +126,10 @@ footer {
 .hero .grad {
   background: linear-gradient(90deg, var(--primary), var(--primary-2));
   -webkit-background-clip: text; background-clip: text; color: transparent;
+  /* Keep the gradient phrase on one line so the title doesn't break into a
+     lonely "retraining." tail; the h1 itself still wraps between "models"
+     and "without" on narrow viewports, which reads cleanly. */
+  white-space: nowrap;
 }
 .hero .lead { color: var(--muted); font-size: 16px; margin: 0 0 22px; }
 /* Wrap: at narrow widths the three CTAs (Try, Docs, Report) would otherwise
@@ -594,18 +598,23 @@ footer {
   .card-head { flex-direction: column; gap: 8px; }
   .hero { padding: 12px 2px 4px; gap: 20px; }
   .hero h1 {
-    /* Shrink the floor so a 24-char title ("Merge fine-tuned …") no longer
+    /* Shrink the floor so a 24-char title ("Merge fine-tuned ...") no longer
        wraps mid-word on a 320px device. The upper clamp still gives the
        hero its presence on tablet/desktop. */
     font-size: clamp(24px, 7vw, 44px);
     letter-spacing: -0.2px;
   }
-  .hero .lead { font-size: 14.5px; margin-bottom: 16px; }
+  .hero .lead { font-size: 14px; line-height: 1.5; margin-bottom: 16px; }
   .hero-cta { gap: 10px; width: 100%; }
   /* 140px minimum per button so each label ("Report an issue") stays on one
      line; wrap takes over when all three won't fit on the row. */
   .hero-cta .btn { flex: 1 1 140px; justify-content: center; min-width: 0; }
-  .credits { font-size: 12.5px; gap: 4px 12px; }
+  .credits { font-size: 12.5px; gap: 4px 12px; margin-top: 14px; padding-top: 12px; }
+  /* Shrink the terminal preview so its 65-column ascii art fits inside the
+     card without a side-scroll on a phone. */
+  .codecard pre { font-size: 10.5px; padding: 12px 12px; line-height: 1.5; }
+  .codecard-head { padding: 8px 12px; }
+  .codecard-head .cc-title { font-size: 11px; }
 
   /* Prevent long tokens (checkpoint ids, hf-paths, uuids) from forcing a
      scroll inside the already-narrow job detail / library panes. */
