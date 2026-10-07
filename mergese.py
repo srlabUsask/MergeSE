@@ -59,7 +59,16 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Tuple
+
+# Type-checker-only import so string annotations like `"torch.Tensor"` resolve
+# for ruff / pyright / mypy without triggering the torch import at startup
+# (actual torch use is still gated through `_lazy_torch()` inside each merge
+# function). Without this, F821 flagged every annotated signature as an
+# undefined-name false positive and we had to disable F821 globally - which
+# in turn let a real bug slip through (`_REGISTRY` undefined in cmd_merge).
+if TYPE_CHECKING:  # pragma: no cover
+    import torch  # noqa: F401
 
 import click
 
@@ -1026,34 +1035,39 @@ def _build_architecture_eval_fn(
         torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     )
 
-    # Preload the architectural shell once (config + classifier head). Each
-    # call to eval_fn only has to load_state_dict on the already-constructed
-    # module, which is cheap.
     resolved = _resolve_path(base_path)
+
+    # Preload a bare encoder + a classifier head once. The merge driver
+    # produces a merged_sd whose keys match an AutoModel's native layout
+    # (`encoder.layer.N.*` for BERT, `encoder.layer.N.*` under `roberta` for
+    # RoBERTa when wrapped). We score by loading STATE-DICT INTO THE ENCODER
+    # DIRECTLY (not into a classification wrapper whose keys are prefixed
+    # with `bert.`/`roberta.`), so the layer-swap we're measuring actually
+    # reaches the forward pass. A previous version loaded into
+    # AutoModelForSequenceClassification with strict=False, which silently
+    # discarded every candidate encoder tensor as "unexpected" and scored
+    # the base over and over - the hill climb returned no winner even when
+    # a swap would have helped.
+    enc_shell = transformers.AutoModel.from_pretrained(resolved)
+    hidden = int(enc_shell.config.hidden_size)
     custom_head_path = Path(resolved) / "classifier_head.bin"
     if custom_head_path.exists():
         head_sd = torch.load(str(custom_head_path), map_location="cpu", weights_only=True)
         num_labels = int(head_sd.get("num_labels", 2))
         dropout_p = float(head_sd.get("dropout", 0.1))
-        encoder = transformers.AutoModel.from_pretrained(resolved)
-        hidden = int(encoder.config.hidden_size)
-
-        class _ShellModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.encoder = encoder
-                self.dropout = torch.nn.Dropout(dropout_p)
-                self.classifier = torch.nn.Linear(hidden, num_labels)
-                self.classifier.load_state_dict(head_sd["classifier"])
-
-            def forward(self, input_ids=None, attention_mask=None, **kw):
-                out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-                cls = out.last_hidden_state[:, 0, :]
-                return type("Out", (), {"logits": self.classifier(self.dropout(cls))})()
-        shell = _ShellModel()
+        classifier = torch.nn.Linear(hidden, num_labels)
+        classifier.load_state_dict(head_sd["classifier"])
     else:
-        shell = transformers.AutoModelForSequenceClassification.from_pretrained(resolved)
-    shell.to(dev).eval()
+        # No sidecar: the user hasn't supplied a trained task head for the
+        # base. We make a random Linear so hill-climbing can still RANK
+        # candidates relative to each other, but the absolute F1 is noise.
+        # Document this in the stats so a reader isn't misled.
+        num_labels = 2
+        dropout_p = 0.1
+        classifier = torch.nn.Linear(hidden, num_labels)
+    enc_shell.to(dev).eval()
+    classifier.to(dev).eval()
+    dropout = torch.nn.Dropout(dropout_p)
     tok = transformers.AutoTokenizer.from_pretrained(resolved)
 
     # Pre-slurp the eval CSV so each probe just re-tokenises its rows.
@@ -1065,37 +1079,69 @@ def _build_architecture_eval_fn(
             if limit and i >= limit:
                 break
             rows.append(row)
+    # A3 (pressure test): refuse an empty eval slice. Scoring with zero
+    # examples would compute an undefined F1 and silently "succeed".
+    if not rows:
+        raise click.UsageError(
+            "eval dataset is empty - architecture merge needs at least one "
+            "labelled example to score candidate layer swaps against. Check "
+            "the --eval-data CSV has a `label` column and non-header rows."
+        )
     pair_mode = detect_input_kind(header) == "pair"
     y_true_fixed = [int(r["label"]) for r in rows]
 
-    # Decide the metric mode once: binary when all labels are 0/1, else macro.
+    # A1 fix: use the imported `get_task` accessor; `_REGISTRY` is a private
+    # dict inside mergese_tasks that isn't imported here. The previous code
+    # NameError'd whenever --task was supplied, which is the preset default
+    # for the architecture preset.
     binary_ok = set(y_true_fixed) <= {0, 1}
-    task_spec = _REGISTRY.get(task) if task else None
+    task_spec = get_task(task) if task else None
     metric_mode = "binary" if binary_ok and (
         not task_spec or task_spec.metric == "binary_f1"
     ) else "macro"
 
     def eval_fn(state_dict) -> float:
-        # load_state_dict with strict=False tolerates small discrepancies
-        # between the shell and whatever candidate we're probing (e.g. an
-        # inert sidecar key). The caller swaps only matched-shape tensors.
         with torch.no_grad():
-            shell.load_state_dict(state_dict, strict=False)
+            # A2 fix: strict=True so a key-layout mismatch between the merged
+            # state-dict and the encoder shell is a loud failure, not a
+            # silent "every candidate scores the same because no weights were
+            # actually loaded". The merge driver guarantees merged_sd has the
+            # encoder's native key layout (it starts from base_m.state_dict,
+            # which came from AutoModel.from_pretrained).
+            enc_shell.load_state_dict(state_dict, strict=True)
             y_pred: List[int] = []
             buf: List[dict] = []
+
+            def _tok_batch(batch_rows):
+                if pair_mode:
+                    a = [r["code1"] for r in batch_rows]
+                    b = [r["code2"] for r in batch_rows]
+                    enc = tok(a, b, truncation=True, max_length=max_length,
+                              padding=True, return_tensors="pt")
+                else:
+                    a = [r["code"] for r in batch_rows]
+                    enc = tok(a, truncation=True, max_length=max_length,
+                              padding=True, return_tensors="pt")
+                return {k: v.to(dev) for k, v in enc.items()}
+
+            def _score_batch(batch_rows):
+                enc = _tok_batch(batch_rows)
+                out = enc_shell(**enc)
+                cls_h = out.last_hidden_state[:, 0, :]
+                logits = classifier(dropout(cls_h))
+                y_pred.extend(logits.argmax(dim=-1).cpu().tolist())
+
             for row in rows:
                 buf.append(row)
                 if len(buf) >= batch_size:
-                    _run_batch(shell, tok, buf, pair_mode, max_length, dev,
-                               [], y_pred)
-                    buf.clear()
+                    _score_batch(buf); buf.clear()
             if buf:
-                _run_batch(shell, tok, buf, pair_mode, max_length, dev, [], y_pred)
+                _score_batch(buf)
         try:
             m = _compute_metrics(y_true_fixed, y_pred, mode=metric_mode)
         except ValueError:
-            # Rare: out-of-domain prediction. Score as 0 so the hill climb
-            # keeps the previous (valid) state.
+            # Rare: out-of-domain prediction (num_labels mismatch). Score as
+            # 0 so hill-climb keeps the previous (valid) state.
             return 0.0
         return float(m.get("f1", 0.0))
 
