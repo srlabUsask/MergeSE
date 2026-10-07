@@ -132,6 +132,24 @@
       }
     },
     {
+      "name": "Architecture merge (greedy): CodeBERT + GraphCodeBERT + UniXcoder on BCB",
+      "kind": "merge",
+      "description": "Greedy hill-climbing layer stitching: starts from the CodeBERT fine-tune and, for each encoder layer, swaps in GraphCodeBERT's / UniXcoder's version only if it improves F1 on a 200-row BigCloneBench slice. Known baseline from Zhou et al. (NeurIPS 2025). Needs an eval dataset so the hill climb has something to score against.",
+      "body": {
+        "models": [
+          "server://codebert_bcb",
+          "server://graphcodebert_bcb",
+          "server://unixcoder_bcb"
+        ],
+        "base": "server://codebert_bcb",
+        "method": "architecture",
+        "seed": 42,
+        "task": "clone_detection",
+        "eval_data": "bundled://bigclonebench",
+        "eval_limit": 200
+      }
+    },
+    {
       "name": "Cross-task encoder merge (demo: public encoders)",
       "kind": "merge",
       "description": "Encoder-only DARE-TIES across three public SE encoders. Demonstrates the --encoder-only path for merging checkpoints with mismatched classifier heads; the base's head is preserved so you can attach a fresh task-specific head downstream.",

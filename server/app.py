@@ -1370,7 +1370,7 @@ def api_merge():
     models = _field_str_list(body, "models", min_items=2)
     base = _field_str(body, "base", required=True)
     method = _field_enum(body, "method",
-                         ("ties", "dare-ties", "wudi", "pcb", "average"),
+                         ("ties", "dare-ties", "wudi", "pcb", "average", "architecture"),
                          default="ties")
     trim_percentile = _field_number(body, "trim_percentile", default=20.0,
                                     min_value=0.0, max_value=99.0)
@@ -1385,6 +1385,17 @@ def api_merge():
     seed = _field_number(body, "seed", default=42, min_value=0, max_value=2**31 - 1, as_int=True)
     task = _field_str(body, "task", default="") or ""
     encoder_only = _field_bool_or_none(body, "encoder_only")
+    # --- architecture-only knobs (ignored by the closed-form methods) ---
+    eval_data_ref = _field_str(body, "eval_data")
+    eval_limit = _field_number(body, "eval_limit", default=200, min_value=1, max_value=100000, as_int=True)
+    eval_batch_size = _field_number(body, "eval_batch_size", default=16, min_value=1, max_value=4096, as_int=True)
+    eval_max_length = _field_number(body, "eval_max_length", default=256, min_value=1, max_value=16384, as_int=True)
+    if method == "architecture" and not eval_data_ref:
+        return jsonify({
+            "error": "method 'architecture' needs 'eval_data' (a dataset ref); "
+                     "greedy layer stitching uses a small validation slice to "
+                     "score each candidate layer swap."
+        }), 400
     over = _capacity_response()
     if over:
         return over
@@ -1392,6 +1403,9 @@ def api_merge():
     try:
         resolved_models = [resolve_model_ref(m, owner=owner) for m in models]
         resolved_base = resolve_model_ref(base, owner=owner)
+        resolved_eval_csv = (
+            resolve_dataset_ref(eval_data_ref, owner=owner) if eval_data_ref else None
+        )
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
@@ -1426,6 +1440,11 @@ def api_merge():
         args.append("--encoder-only")
     elif encoder_only is False:
         args.append("--include-heads")
+    if resolved_eval_csv:
+        args.extend(["--eval-data", resolved_eval_csv,
+                     "--eval-limit", str(eval_limit),
+                     "--eval-batch-size", str(eval_batch_size),
+                     "--eval-max-length", str(eval_max_length)])
 
     job = _new_job("merge", args, body, job_id=job_id, owner=owner)
     job.artifacts["output_dir"] = str(out_dir)

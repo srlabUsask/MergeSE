@@ -55,6 +55,7 @@ import json
 import logging
 import math
 import random
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -881,6 +882,227 @@ def pcb_merge(
 
 
 # ---------------------------------------------------------------------------
+# Architecture merging - greedy layer stitching (data-driven)
+# ---------------------------------------------------------------------------
+#
+# Unlike the closed-form methods above (TIES / DARE / WUDI / PCB / average), the
+# architecture merger needs a tiny held-out slice of validation data to score
+# candidate layer swaps. Hill-climb from the base: for each encoder layer in
+# turn, try replacing that layer's weights with every specialist's version,
+# measure the metric on the eval slice, and keep whichever swap (if any)
+# improves it. Equivalent to the "greedy" baseline in Zhou et al. (NeurIPS
+# 2025) and the common franken-merge pattern in the merging literature.
+#
+# This is INTENTIONALLY the greedy baseline. The RL / Pareto layers from the
+# authors' separate research track belong in their own PR when that paper is
+# in the open.
+
+
+def _encoder_layer_prefixes(sd_keys: Iterable[str]) -> Tuple[str, int]:
+    """Introspect a state dict and return (prefix, num_layers) for the encoder.
+
+    Handles the two common HF layouts: a bare encoder (keys like
+    `encoder.layer.0.*`) and a classification-head wrapper (keys like
+    `bert.encoder.layer.0.*` / `roberta.encoder.layer.0.*`). Raises if neither
+    layout is detectable - the caller should fall back to refusing the merge.
+    """
+    layer_idx_re = re.compile(r"^(.*encoder\.layer\.)(\d+)\.")
+    seen: Dict[str, int] = {}
+    for k in sd_keys:
+        m = layer_idx_re.match(k)
+        if m:
+            pfx, idx = m.group(1), int(m.group(2))
+            seen[pfx] = max(seen.get(pfx, -1), idx)
+    if not seen:
+        raise ValueError(
+            "could not locate encoder.layer.N.* keys in the state dict - "
+            "the architecture merger only supports BERT/RoBERTa-style encoders."
+        )
+    # Pick the prefix with the most layers (handles sidecar heads with their
+    # own tiny "classifier.layer.*" false positives, if any ever appear).
+    pfx, max_idx = max(seen.items(), key=lambda kv: kv[1])
+    return pfx, max_idx + 1
+
+
+def architecture_greedy_merge(
+    base_sd: Dict[str, "torch.Tensor"],                   # type: ignore[name-defined]
+    specialist_sds: Sequence[Dict[str, "torch.Tensor"]],  # type: ignore[name-defined]
+    eval_fn,
+    num_layers: Optional[int] = None,
+    layer_prefix: Optional[str] = None,
+    progress_cb=None,
+) -> Tuple[Dict[str, "torch.Tensor"], dict]:              # type: ignore[name-defined]
+    """Greedy hill-climbing architecture merge.
+
+    `eval_fn(state_dict) -> float`: higher is better. Caller supplies this
+    closure so the merge driver stays math-only and the heavy "build a model,
+    run inference, compute metric" machinery lives next to the evaluate CLI.
+
+    Starts from the base's state dict, scores it once, then walks encoder
+    layers in order: for each layer index L, tries every specialist in turn,
+    keeps the FIRST swap that strictly improves the score. If no swap helps,
+    the base's layer wins. Returns the merged state dict + stats showing which
+    specialist won each layer and the final score.
+    """
+    if not specialist_sds:
+        raise click.UsageError("architecture merge needs at least one specialist")
+    if layer_prefix is None or num_layers is None:
+        layer_prefix, detected = _encoder_layer_prefixes(base_sd.keys())
+        num_layers = num_layers or detected
+
+    merged_sd = {k: v for k, v in base_sd.items()}
+    base_score = float(eval_fn(merged_sd))
+    best_score = base_score
+    winners: List[int] = []  # -1 for "base kept"
+    swap_scores: List[float] = []
+
+    for layer_idx in range(num_layers):
+        pfx = f"{layer_prefix}{layer_idx}."
+        layer_keys = [k for k in merged_sd if k.startswith(pfx)]
+        if not layer_keys:
+            winners.append(-1); swap_scores.append(best_score); continue
+        chosen = -1
+        for spec_idx, spec_sd in enumerate(specialist_sds):
+            # Build a transient trial: swap in this specialist's layer tensors
+            # where shapes match the current merged dict's. Shape-mismatched
+            # tensors (e.g. a specialist's larger vocab embeddings leaked in)
+            # are left on the base's values.
+            trial = dict(merged_sd)
+            any_swapped = False
+            for k in layer_keys:
+                v = spec_sd.get(k)
+                if v is not None and v.shape == merged_sd[k].shape:
+                    trial[k] = v
+                    any_swapped = True
+            if not any_swapped:
+                continue
+            trial_score = float(eval_fn(trial))
+            if trial_score > best_score:
+                best_score = trial_score
+                merged_sd = trial
+                chosen = spec_idx
+        winners.append(chosen)
+        swap_scores.append(best_score)
+        if progress_cb is not None:
+            progress_cb(layer_idx + 1, num_layers)
+
+    stats = {
+        "method": "architecture",
+        "base_score": base_score,
+        "final_score": best_score,
+        "improvement": best_score - base_score,
+        "num_layers": num_layers,
+        "layer_prefix": layer_prefix,
+        "layer_winners": winners,                     # -1 = base kept
+        "layer_scores_after_each_step": swap_scores,  # cumulative best
+        "num_specialists": len(specialist_sds),
+    }
+    return merged_sd, stats
+
+
+def _build_architecture_eval_fn(
+    base_path: str,
+    resolved_eval_csv: str,
+    limit: int,
+    batch_size: int,
+    max_length: int,
+    device: Optional[str],
+    task: str,
+):
+    """Return `eval_fn(state_dict) -> float` for architecture_greedy_merge.
+
+    The returned callable builds a model from `base_path`'s config, loads the
+    candidate state_dict into it, runs inference on up to `limit` rows of the
+    eval CSV, and returns the appropriate metric (binary F1 by default, macro
+    F1 for multi-class tasks). The underlying model + tokenizer are loaded
+    once and reused across calls to avoid 100× redundant disk reads during the
+    hill-climb.
+    """
+    torch = _lazy_torch()
+    transformers = _lazy_transformers()
+    import csv as _csv
+
+    dev = torch.device(device) if device else (
+        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    )
+
+    # Preload the architectural shell once (config + classifier head). Each
+    # call to eval_fn only has to load_state_dict on the already-constructed
+    # module, which is cheap.
+    resolved = _resolve_path(base_path)
+    custom_head_path = Path(resolved) / "classifier_head.bin"
+    if custom_head_path.exists():
+        head_sd = torch.load(str(custom_head_path), map_location="cpu", weights_only=True)
+        num_labels = int(head_sd.get("num_labels", 2))
+        dropout_p = float(head_sd.get("dropout", 0.1))
+        encoder = transformers.AutoModel.from_pretrained(resolved)
+        hidden = int(encoder.config.hidden_size)
+
+        class _ShellModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = encoder
+                self.dropout = torch.nn.Dropout(dropout_p)
+                self.classifier = torch.nn.Linear(hidden, num_labels)
+                self.classifier.load_state_dict(head_sd["classifier"])
+
+            def forward(self, input_ids=None, attention_mask=None, **kw):
+                out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+                cls = out.last_hidden_state[:, 0, :]
+                return type("Out", (), {"logits": self.classifier(self.dropout(cls))})()
+        shell = _ShellModel()
+    else:
+        shell = transformers.AutoModelForSequenceClassification.from_pretrained(resolved)
+    shell.to(dev).eval()
+    tok = transformers.AutoTokenizer.from_pretrained(resolved)
+
+    # Pre-slurp the eval CSV so each probe just re-tokenises its rows.
+    with open(resolved_eval_csv, "r", encoding="utf-8") as fh:
+        reader = _csv.DictReader(fh)
+        header = reader.fieldnames or []
+        rows = []
+        for i, row in enumerate(reader):
+            if limit and i >= limit:
+                break
+            rows.append(row)
+    pair_mode = detect_input_kind(header) == "pair"
+    y_true_fixed = [int(r["label"]) for r in rows]
+
+    # Decide the metric mode once: binary when all labels are 0/1, else macro.
+    binary_ok = set(y_true_fixed) <= {0, 1}
+    task_spec = _REGISTRY.get(task) if task else None
+    metric_mode = "binary" if binary_ok and (
+        not task_spec or task_spec.metric == "binary_f1"
+    ) else "macro"
+
+    def eval_fn(state_dict) -> float:
+        # load_state_dict with strict=False tolerates small discrepancies
+        # between the shell and whatever candidate we're probing (e.g. an
+        # inert sidecar key). The caller swaps only matched-shape tensors.
+        with torch.no_grad():
+            shell.load_state_dict(state_dict, strict=False)
+            y_pred: List[int] = []
+            buf: List[dict] = []
+            for row in rows:
+                buf.append(row)
+                if len(buf) >= batch_size:
+                    _run_batch(shell, tok, buf, pair_mode, max_length, dev,
+                               [], y_pred)
+                    buf.clear()
+            if buf:
+                _run_batch(shell, tok, buf, pair_mode, max_length, dev, [], y_pred)
+        try:
+            m = _compute_metrics(y_true_fixed, y_pred, mode=metric_mode)
+        except ValueError:
+            # Rare: out-of-domain prediction. Score as 0 so the hill climb
+            # keeps the previous (valid) state.
+            return 0.0
+        return float(m.get("f1", 0.0))
+
+    return eval_fn
+
+
+# ---------------------------------------------------------------------------
 # Saving merged checkpoint
 # ---------------------------------------------------------------------------
 
@@ -1129,7 +1351,8 @@ def cmd_inspect(ctx: click.Context, models: Tuple[str, ...], base: Optional[str]
 @cli.command("merge")
 @click.argument("models", nargs=-1, required=True)
 @click.option("--base", required=True, help="Path to the shared pre-trained base checkpoint.")
-@click.option("--method", type=click.Choice(["ties", "dare-ties", "wudi", "pcb", "average"]),
+@click.option("--method",
+              type=click.Choice(["ties", "dare-ties", "wudi", "pcb", "average", "architecture"]),
               default="ties", show_default=True)
 @click.option("--trim-percentile", type=float, default=20.0, show_default=True,
               help="TIES trim threshold (percentile of |Δ| zeroed).")
@@ -1162,12 +1385,26 @@ def cmd_inspect(ctx: click.Context, models: Tuple[str, ...], base: Optional[str]
 @click.option("--task", type=click.Choice([*task_names(), ""]), default="",
               help="Optional task hint (clone_detection, vulnerability_detection, "
                    "defect_prediction, ...). Used only to label artifacts.")
+@click.option("--eval-data", default=None,
+              help="Dataset path (CSV) used to score candidate layer swaps "
+                   "(only used for --method architecture). The server accepts "
+                   "bundled:// / dataset:// / hf-dataset:// refs here too; the "
+                   "web layer resolves them before invoking the CLI.")
+@click.option("--eval-limit", type=int, default=200, show_default=True,
+              help="Rows sampled from --eval-data per hill-climbing probe "
+                   "(only used for --method architecture).")
+@click.option("--eval-batch-size", type=int, default=16, show_default=True,
+              help="Batch size for architecture-merge eval probes.")
+@click.option("--eval-max-length", type=int, default=256, show_default=True,
+              help="Max token length for architecture-merge eval probes.")
 @click.pass_context
 def cmd_merge(ctx: click.Context, models: Tuple[str, ...], base: str, method: str,
               trim_percentile: float, drop_rate: float, wudi_steps: int, wudi_lr: float,
               pcb_ratio: float, pcb_lambda: float, pcb_scope: str,
               device: Optional[str], weights: Optional[str],
-              output: str, seed: int, encoder_only: Optional[bool], task: str) -> None:
+              output: str, seed: int, encoder_only: Optional[bool], task: str,
+              eval_data: Optional[str], eval_limit: int,
+              eval_batch_size: int, eval_max_length: int) -> None:
     """Merge two or more checkpoints into a single HuggingFace model."""
     if len(models) < 2:
         raise click.UsageError("merge requires at least 2 model paths.")
@@ -1349,6 +1586,32 @@ def cmd_merge(ctx: click.Context, models: Tuple[str, ...], base: str, method: st
             )
     elif method == "average":
         merged_sd, stats = average_merge(base_m.state_dict, deltas, w)
+    elif method == "architecture":
+        if not eval_data:
+            raise click.UsageError(
+                "--method architecture needs --eval-data: hill-climbing uses a "
+                "mini validation slice to score every layer-swap candidate."
+            )
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                      BarColumn(), TimeElapsedColumn(), console=console, transient=True) as p:
+            atask = p.add_task("architecture greedy stitch", total=None)
+
+            def _arch_progress(done: int, total: int) -> None:
+                p.update(atask, total=total, completed=done)
+
+            eval_fn = _build_architecture_eval_fn(
+                base_path=base, resolved_eval_csv=eval_data,
+                limit=eval_limit, batch_size=eval_batch_size,
+                max_length=eval_max_length, device=device, task=task,
+            )
+            merged_sd, stats = architecture_greedy_merge(
+                base_m.state_dict,
+                [m.state_dict for m in loaded],
+                eval_fn=eval_fn,
+                progress_cb=_arch_progress,
+            )
+            stats["eval_data"] = eval_data
+            stats["eval_limit"] = eval_limit
     else:
         raise click.UsageError(f"unknown method: {method}")
     elapsed = time.time() - t0
