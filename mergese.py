@@ -80,7 +80,7 @@ from mergese_tasks import (
     pick_metric,
 )
 
-__version__ = "0.2.0"
+__version__ = "2.0.0"
 
 # Heuristics for "classifier head" tensors that are tied to a specific task
 # (number of labels) and therefore not safely mergeable across tasks.

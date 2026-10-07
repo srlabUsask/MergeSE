@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use MergeSE, please cite the tool paper below."
 type: software
 title: "MergeSE: Post-hoc Model Merging for Software Engineering Tasks Without Retraining"
-version: 0.2.0
+version: 2.0.0
 license: Apache-2.0
 repository-code: "https://github.com/srlabUsask/MergeSE"
 url: "https://arxiv.org/abs/2608.04181"
