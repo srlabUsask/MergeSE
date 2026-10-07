@@ -310,3 +310,58 @@ def test_cancel_pending_job(monkeypatch, tmp_path):
     assert body["ok"] is True and body["status"] == "cancelled"
     assert app.JOBS[jid].status == "cancelled"
     assert app.JOBS[jid].finished_at is not None
+
+
+# ---- B03 (retest) — hf:// must reject dot-component path smuggling ----------
+
+def test_hf_prefix_rejects_relative_path_components(monkeypatch, tmp_path):
+    """Regex that let `.` / `..` through as namespace components allowed
+    hf://../secret -> ../secret to leak out of the resolver. Tighten to a
+    strict HF-component regex that requires each component start with an
+    alphanumeric / underscore / hyphen (not a dot)."""
+    app = _load_app(monkeypatch, tmp_path)
+    for bad in ("hf://../secret", "hf://./secret", "hf://.", "hf://..",
+                "hf://../../etc/passwd", "hf://foo/./bar", "hf://foo/../bar"):
+        with pytest.raises(ValueError, match="HuggingFace Hub id"):
+            app.resolve_model_ref(bad)
+    # Legit ids with dots inside a component are still fine (model-y.1 etc).
+    assert app.resolve_model_ref("hf://microsoft/codebert-base") == "microsoft/codebert-base"
+    assert app.resolve_model_ref("hf://org_x/model-y.1") == "org_x/model-y.1"
+
+
+# ---- B14 (retest) — invalid field types inside a dict body must 400 --------
+
+def test_json_body_rejects_bad_field_types(monkeypatch, tmp_path):
+    """`{"models": 42}` previously 500'd because the handler did `len(42)` on
+    an int. Per-field validators now return structured 400 responses."""
+    app = _load_app(monkeypatch, tmp_path)
+    client = app.app.test_client()
+    bad_payloads = {
+        "/api/inspect": [
+            {"models": 42},
+            {"models": [1, 2]},             # list of non-strings
+            {"models": ["a", "b"], "base": 7},
+        ],
+        "/api/merge": [
+            {"models": 42, "base": "org/x"},
+            {"models": ["a", "b"], "base": "org/x", "method": "nonsense"},
+            {"models": ["a", "b"], "base": "org/x", "trim_percentile": "high"},
+        ],
+        "/api/evaluate": [
+            {"model": 42},
+            {"model": "org/x", "batch_size": "one"},
+            {"model": "org/x", "metric": "oops"},
+        ],
+        "/api/export": [
+            {"model": 42},
+            {"model": "org/x", "format": "parquet"},  # unknown enum
+        ],
+    }
+    for ep, payloads in bad_payloads.items():
+        for body in payloads:
+            r = client.post(ep, json=body, content_type="application/json")
+            assert r.status_code == 400, f"{ep} with {body!r} returned {r.status_code}"
+            assert r.content_type.startswith("application/json")
+            msg = r.get_json()["error"]
+            # Message should mention the bad field, not just "bad request".
+            assert any(k in msg for k in body.keys()) or "format" in msg or "metric" in msg

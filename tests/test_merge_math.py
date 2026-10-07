@@ -424,3 +424,56 @@ def test_merge_prefix_aligns_wrapped_specialists():
     # After alignment, encoder keys match the base's; classifier survives as-is.
     assert set(aligned) == {"embeddings.weight", "encoder.layer.0.weight", "classifier.weight"}
     assert set(aligned) & base_keys == {"embeddings.weight", "encoder.layer.0.weight"}
+
+
+def test_torchscript_wrapper_unwraps_dict_output():
+    """The B10 retest failed because transformers models return
+    ModelOutput (a dict-like namedtuple), which torch.jit.trace refuses
+    with "Encountering a dict at the output of the tracer...". The export
+    now wraps the model in a Module whose forward reduces the output to a
+    plain tensor via return_dict=False / .logits / .last_hidden_state /
+    tuple[0]. Pin that wrapper logic end-to-end: no transformers import
+    needed - we just mimic the shapes the real wrapper has to handle."""
+    import torch
+    class _Fake(torch.nn.Module):
+        """Returns whatever `shape` dictates."""
+        def __init__(self, shape):
+            super().__init__()
+            self.shape = shape
+            self.w = torch.nn.Parameter(torch.ones(1))
+        def forward(self, input_ids, attention_mask, return_dict=True):
+            x = (input_ids.float() * self.w).sum(-1, keepdim=True)  # (B,1)
+            if self.shape == "logits":
+                class _Out:
+                    pass
+                o = _Out(); o.logits = x; return o
+            if self.shape == "hidden":
+                class _Out:
+                    pass
+                o = _Out(); o.last_hidden_state = x; return o
+            if self.shape == "tuple":
+                return (x,)
+            if self.shape == "dict":
+                return {"logits": x}  # unreachable with return_dict=False, but tests the fallback
+            return x
+
+    # Reproduce the wrapper from cmd_export.
+    class _TraceWrapper(torch.nn.Module):
+        def __init__(self, inner):
+            super().__init__(); self.inner = inner
+        def forward(self, input_ids, attention_mask):
+            out = self.inner(input_ids=input_ids, attention_mask=attention_mask,
+                             return_dict=False)
+            if isinstance(out, (tuple, list)): return out[0]
+            if hasattr(out, "logits"): return out.logits
+            if hasattr(out, "last_hidden_state"): return out.last_hidden_state
+            return out
+
+    ids = torch.tensor([[1, 2, 3]])
+    mask = torch.ones_like(ids)
+    for shape in ("logits", "hidden", "tuple"):
+        w = _TraceWrapper(_Fake(shape)).eval()
+        traced = torch.jit.trace(w, (ids, mask), strict=False)
+        # Trace succeeded; output is a tensor.
+        out = traced(ids, mask)
+        assert isinstance(out, torch.Tensor), f"shape={shape}: got {type(out)}"

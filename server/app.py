@@ -115,6 +115,24 @@ _default_bin = (
 MERGESE_BIN = os.environ.get("MERGESE_BIN", _default_bin)
 CHECKPOINTS_ROOT = os.environ.get("MERGESE_CHECKPOINTS", "")
 DATASETS_ROOT = os.environ.get("MERGESE_DATASETS", "")  # optional admin-mounted CSVs
+# B05: the job registry is in-process memory. Running multiple gunicorn
+# workers makes job lookups 404 from any worker that didn't create the job.
+# Loud warning + a visible banner in /api/health when the operator sets a
+# worker count above 1 anywhere we can see it.
+try:
+    _mergese_workers = int(os.environ.get("MERGESE_WORKERS", "1"))
+except (TypeError, ValueError):
+    _mergese_workers = 1
+if _mergese_workers > 1:
+    import logging as _logging
+    _logging.getLogger("mergese").warning(
+        "MERGESE_WORKERS=%s: job state is in-process memory, so lookups "
+        "will 404 unpredictably across workers. Set workers back to 1 "
+        "and scale with --threads instead until job state moves to shared "
+        "storage.", _mergese_workers,
+    )
+
+
 BENCHMARKS_ROOT = Path(os.environ.get(
     "MERGESE_BENCHMARKS",
     str(_first_existing_dir(
@@ -462,7 +480,12 @@ def _owns(dir_path: Path, owner: Optional[str]) -> bool:
 
 # ---- model-reference resolution ---------------------------------------------
 
-_HF_ID = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$")
+# A single HF Hub path component (org or model name). Must start with an
+# alphanumeric/underscore/hyphen (NOT a dot) and may contain dots afterwards.
+# Disallowing a leading dot stops `.` / `..` / `./secret` from passing as a
+# "valid id" and later resolving to a relative path on disk (B03 retest).
+_HF_COMPONENT = r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,95}"
+_HF_ID = re.compile(rf"^{_HF_COMPONENT}(?:/{_HF_COMPONENT})?$")
 
 
 def _json_body() -> dict:
@@ -480,6 +503,75 @@ def _json_body() -> dict:
     if not isinstance(body, dict):
         abort(400, description="request body must be a JSON object")
     return body
+
+
+# ---- per-field body validators ----------------------------------------------
+# Catch bad field types (e.g. {"models": 42}) with a readable 400 instead of
+# letting the handler reach a `len(42)` and 500. Keep validation narrow -
+# only shapes the handlers actually read.
+
+def _field_str(body: dict, key: str, *, required: bool = False,
+               default: Optional[str] = None) -> Optional[str]:
+    v = body.get(key, default)
+    if v is None:
+        if required:
+            abort(400, description=f"missing required field {key!r}")
+        return default
+    if not isinstance(v, str):
+        abort(400, description=f"{key!r} must be a string, got {type(v).__name__}")
+    return v
+
+
+def _field_str_list(body: dict, key: str, *, required: bool = False,
+                    min_items: int = 0) -> List[str]:
+    v = body.get(key)
+    if v is None:
+        if required or min_items > 0:
+            abort(400, description=f"missing required field {key!r}")
+        return []
+    if not isinstance(v, list):
+        abort(400, description=f"{key!r} must be a list, got {type(v).__name__}")
+    for i, item in enumerate(v):
+        if not isinstance(item, str):
+            abort(400, description=f"{key!r}[{i}] must be a string, got {type(item).__name__}")
+    if len(v) < min_items:
+        abort(400, description=f"{key!r} must have at least {min_items} entries, got {len(v)}")
+    return v
+
+
+def _field_number(body: dict, key: str, *, default: Optional[float] = None,
+                  min_value: Optional[float] = None,
+                  max_value: Optional[float] = None,
+                  as_int: bool = False) -> Optional[float]:
+    v = body.get(key, default)
+    if v is None:
+        return default
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        abort(400, description=f"{key!r} must be a number, got {type(v).__name__}")
+    if min_value is not None and v < min_value:
+        abort(400, description=f"{key!r} must be >= {min_value}")
+    if max_value is not None and v > max_value:
+        abort(400, description=f"{key!r} must be <= {max_value}")
+    return int(v) if as_int else float(v)
+
+
+def _field_bool_or_none(body: dict, key: str) -> Optional[bool]:
+    v = body.get(key)
+    if v is None:
+        return None
+    if not isinstance(v, bool):
+        abort(400, description=f"{key!r} must be a boolean, got {type(v).__name__}")
+    return v
+
+
+def _field_enum(body: dict, key: str, allowed: Tuple[str, ...], *,
+                default: Optional[str] = None) -> Optional[str]:
+    v = body.get(key, default)
+    if v is None:
+        return default
+    if not isinstance(v, str) or v not in allowed:
+        abort(400, description=f"{key!r} must be one of {list(allowed)}, got {v!r}")
+    return v
 
 
 def _contained_in(path: Path, root: Path) -> bool:
@@ -1243,10 +1335,8 @@ def _cli_version() -> str:
 def api_inspect():
     owner = _authenticate()
     body = _json_body()
-    models = body.get("models") or []
-    base = body.get("base")
-    if len(models) < 2:
-        return jsonify({"error": "models[] must have at least 2 entries"}), 400
+    models = _field_str_list(body, "models", min_items=2)
+    base = _field_str(body, "base")
     over = _capacity_response()
     if over:
         return over
@@ -1270,22 +1360,24 @@ def api_inspect():
 def api_merge():
     owner = _authenticate()
     body = _json_body()
-    models = body.get("models") or []
-    base = body.get("base")
-    method = body.get("method", "ties")
-    trim_percentile = body.get("trim_percentile", 20.0)
-    drop_rate = body.get("drop_rate", 0.3)
-    wudi_steps = body.get("wudi_steps")
-    wudi_lr = body.get("wudi_lr")
-    pcb_ratio = body.get("pcb_ratio")
-    pcb_lambda = body.get("pcb_lambda")
-    pcb_scope = body.get("pcb_scope")
-    weights = body.get("weights")
-    seed = body.get("seed", 42)
-    task = body.get("task") or ""
-    encoder_only = body.get("encoder_only", None)
-    if len(models) < 2 or not base:
-        return jsonify({"error": "merge requires models[] (>=2) and base"}), 400
+    models = _field_str_list(body, "models", min_items=2)
+    base = _field_str(body, "base", required=True)
+    method = _field_enum(body, "method",
+                         ("ties", "dare-ties", "wudi", "pcb", "average"),
+                         default="ties")
+    trim_percentile = _field_number(body, "trim_percentile", default=20.0,
+                                    min_value=0.0, max_value=99.0)
+    drop_rate = _field_number(body, "drop_rate", default=0.3,
+                              min_value=0.0, max_value=0.99)
+    wudi_steps = _field_number(body, "wudi_steps", min_value=1, max_value=100000, as_int=True)
+    wudi_lr = _field_number(body, "wudi_lr", min_value=0.0, max_value=1.0)
+    pcb_ratio = _field_number(body, "pcb_ratio", min_value=0.01, max_value=1.0)
+    pcb_lambda = _field_number(body, "pcb_lambda", min_value=0.0, max_value=1000.0)
+    pcb_scope = _field_enum(body, "pcb_scope", ("global", "tensor"))
+    weights = _field_str(body, "weights")
+    seed = _field_number(body, "seed", default=42, min_value=0, max_value=2**31 - 1, as_int=True)
+    task = _field_str(body, "task", default="") or ""
+    encoder_only = _field_bool_or_none(body, "encoder_only")
     over = _capacity_response()
     if over:
         return over
@@ -1339,20 +1431,18 @@ def api_merge():
 def api_evaluate():
     owner = _authenticate()
     body = _json_body()
-    model = body.get("model")
-    task = body.get("task", "clone_detection")
-    dataset = body.get("dataset")
-    test_file = body.get("test_file")
-    batch_size = body.get("batch_size", 32)
-    max_length = body.get("max_length", 512)
-    limit = body.get("limit", 0)
-    if not model:
-        return jsonify({"error": "model required"}), 400
+    model = _field_str(body, "model", required=True)
+    task = _field_str(body, "task", default="clone_detection")
+    dataset = _field_str(body, "dataset")
+    test_file = _field_str(body, "test_file")
+    batch_size = _field_number(body, "batch_size", default=32, min_value=1, max_value=4096, as_int=True)
+    max_length = _field_number(body, "max_length", default=512, min_value=1, max_value=16384, as_int=True)
+    limit = _field_number(body, "limit", default=0, min_value=0, max_value=10 ** 9, as_int=True)
+    metric = _field_enum(body, "metric", ("auto", "binary", "macro"), default="auto")
     over = _capacity_response()
     if over:
         return over
 
-    metric = body.get("metric", "auto")
     try:
         resolved_model = resolve_model_ref(model, owner=owner)
     except ValueError as e:
@@ -1391,10 +1481,10 @@ def api_evaluate():
 def api_export():
     owner = _authenticate()
     body = _json_body()
-    model = body.get("model")
-    fmt = body.get("format", "huggingface")
-    if not model:
-        return jsonify({"error": "model required"}), 400
+    model = _field_str(body, "model", required=True)
+    fmt = _field_enum(body, "format",
+                      ("huggingface", "onnx", "torchscript"),
+                      default="huggingface")
     over = _capacity_response()
     if over:
         return over
