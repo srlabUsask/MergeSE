@@ -35,6 +35,12 @@ html, body {
     var(--bg);
   min-height: 100vh;
   line-height: 1.55;
+  /* Safety net: a single stray child with an explicit width (long preformatted
+     log line, badly-sized select, embedded iframe, etc.) was pushing the whole
+     page horizontally on phones. Clamp at the viewport so no child can force
+     a horizontal body scroll; individual overflow regions (code blocks, log
+     panes) handle their own scrolling. */
+  overflow-x: hidden;
 }
 
 a { color: var(--primary-2); text-decoration: none; }
@@ -122,7 +128,9 @@ footer {
   -webkit-background-clip: text; background-clip: text; color: transparent;
 }
 .hero .lead { color: var(--muted); font-size: 16px; margin: 0 0 22px; }
-.hero-cta { display: flex; gap: 12px; margin-bottom: 18px; }
+/* Wrap: at narrow widths the three CTAs (Try, Docs, Report) would otherwise
+   push past the viewport edge and force a horizontal scroll. */
+.hero-cta { display: flex; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }
 
 .status-line {
   display: inline-flex; align-items: center; gap: 8px;
@@ -503,8 +511,11 @@ footer {
   font-size: 12.5px;
 }
 .job-detail .result table { width: 100%; border-collapse: collapse; }
-.job-detail .result td { padding: 4px 8px; border-top: 1px solid var(--line); }
-.job-detail .result td.k { color: var(--muted); width: 220px; }
+.job-detail .result td { padding: 4px 8px; border-top: 1px solid var(--line); word-break: break-word; }
+/* On wide screens the label column reads as a tidy fixed strip. On a phone
+   that same 220px would eat most of the row and spill the value column off
+   the right edge, so give it a lower bound and let the rest flow. */
+.job-detail .result td.k { color: var(--muted); min-width: 110px; width: 30%; max-width: 220px; }
 
 /* ----------------------- Docs ----------------------- */
 
@@ -544,17 +555,21 @@ footer {
 /* ----------------------- Responsive ----------------------- */
 
 @media (max-width: 900px) {
-  .hero { grid-template-columns: 1fr; }
+  .hero { grid-template-columns: 1fr; gap: 24px; padding: 20px 4px 8px; }
   .grid { grid-template-columns: 1fr 1fr; }
   .jobs-layout { grid-template-columns: 1fr; }
   .docs-grid { grid-template-columns: 1fr; }
+  /* Keep the library grid from pushing children to a 260px minimum that
+     the viewport can no longer hold once the topbar + main padding are
+     accounted for. 220px fits a 360px-wide phone with margin to spare. */
+  .lib-groups { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
 }
 @media (max-width: 600px) {
   /* Collapse the main nav behind a <details> disclosure. The old rule
      hid everything except the GitHub icon, which left visitors unable
      to reach Library / Jobs / Docs on a phone - and no way to request
      help if the service was broken. */
-  .topbar { flex-wrap: wrap; }
+  .topbar { flex-wrap: wrap; padding: 12px 16px; }
   .topbar nav {
     display: none;
     width: 100%;
@@ -569,6 +584,38 @@ footer {
   .topbar nav a { padding: 10px 8px; border-bottom: none; min-height: 44px; }
   .topbar nav a.running-pill { align-self: flex-start; }
   .grid { grid-template-columns: 1fr; }
+
+  /* Tighten page chrome so forms + hero actually fit inside a 360px phone.
+     Pre-fix: main was 28px side padding → 304px usable → inputs with their
+     own min padding + the lib-groups 260px minmax pushed children past the
+     right edge. */
+  main { padding: 20px 14px 60px; gap: 20px; }
+  .card { padding: 18px 14px 20px; border-radius: 12px; }
+  .card-head { flex-direction: column; gap: 8px; }
+  .hero { padding: 12px 2px 4px; gap: 20px; }
+  .hero h1 {
+    /* Shrink the floor so a 24-char title ("Merge fine-tuned …") no longer
+       wraps mid-word on a 320px device. The upper clamp still gives the
+       hero its presence on tablet/desktop. */
+    font-size: clamp(24px, 7vw, 44px);
+    letter-spacing: -0.2px;
+  }
+  .hero .lead { font-size: 14.5px; margin-bottom: 16px; }
+  .hero-cta { gap: 10px; width: 100%; }
+  /* 140px minimum per button so each label ("Report an issue") stays on one
+     line; wrap takes over when all three won't fit on the row. */
+  .hero-cta .btn { flex: 1 1 140px; justify-content: center; min-width: 0; }
+  .credits { font-size: 12.5px; gap: 4px 12px; }
+
+  /* Prevent long tokens (checkpoint ids, hf-paths, uuids) from forcing a
+     scroll inside the already-narrow job detail / library panes. */
+  .lib-item .meta,
+  .job-detail .meta { word-break: break-word; overflow-wrap: anywhere; }
+  .lib-groups { grid-template-columns: 1fr; }
+
+  /* The brand sub-tagline wraps awkwardly on narrow screens. Hide the small
+     subtitle under the title and let the logo + title stand on their own. */
+  .brand .subtitle { display: none; }
 }
 /* The toggle is hidden above 600px (full nav is already visible). */
 .nav-mobile {
@@ -641,4 +688,15 @@ footer {
 .auth-key-row input {
   flex: 1; padding: 8px 10px; border-radius: 8px;
   border: 1px solid rgba(255, 255, 255, 0.12); background: #0c0e16; color: #e6e9ef;
+  min-width: 0; /* allow the input to shrink below its intrinsic size so the
+                   paste-key button beside it still fits on narrow screens */
+}
+
+/* Phones: shrink the auth gate's chrome so a 300px Cloudflare widget (or
+   its flexible variant) has the full width of the card to render into. */
+@media (max-width: 420px) {
+  .auth-gate { padding: 12px; }
+  .auth-card { padding: 20px 16px; }
+  .auth-key-row { flex-wrap: wrap; }
+  .auth-key-row .btn { width: 100%; }
 }
