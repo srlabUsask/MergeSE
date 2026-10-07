@@ -909,6 +909,19 @@ function _toggleField(input, show) {
   if (!input) return;
   const label = input.closest("label");
   if (label) label.hidden = !show;
+  // Also `disabled` the control itself. HTML5 form validation runs on EVERY
+  // control inside a <form>, including hidden ones (`hidden` is just CSS
+  // display:none, not form-disabled). An invalid-step number input that lives
+  // in a hidden label will fail validation at submit time, and because the
+  // browser can't focus a hidden control to show its error bubble, the submit
+  // event is blocked silently — the "Run merge" button appears to do nothing.
+  // Disabling the control removes it from the validation set.
+  input.disabled = !show;
+  // When the input is a model-list container (eval dataset), disabling its
+  // nested select/input children does the same job.
+  if (input.classList && input.classList.contains("model-list")) {
+    input.querySelectorAll("input, select").forEach((c) => { c.disabled = !show; });
+  }
 }
 
 function applyMethodDefaults(method, opts = {}) {
