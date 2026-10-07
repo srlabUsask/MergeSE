@@ -235,7 +235,18 @@
           <option value="wudi">WUDI</option>
           <option value="pcb">PCB</option>
           <option value="average">Average</option>
+          <option value="architecture">Architecture (greedy)</option>
         </select>
+      </label>
+      <label>
+        <span>Eval dataset (architecture only)</span>
+        <div id="mEvalDataList" class="model-list" data-min="1" data-max="1" data-kind="dataset"></div>
+        <small id="mEvalDataHint" class="hint-inline"></small>
+      </label>
+      <label>
+        <span>Eval rows (architecture only)</span>
+        <input id="mEvalLimit" type="number" min="16" max="10000" step="16" value="200" />
+        <small id="mEvalLimitHint" class="hint-inline"></small>
       </label>
       <label>
         <span>Trim percentile</span>

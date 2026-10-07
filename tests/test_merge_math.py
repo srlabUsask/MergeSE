@@ -477,3 +477,68 @@ def test_torchscript_wrapper_unwraps_dict_output():
         # Trace succeeded; output is a tensor.
         out = traced(ids, mask)
         assert isinstance(out, torch.Tensor), f"shape={shape}: got {type(out)}"
+
+
+# ---- architecture (greedy) merge --------------------------------------------
+
+def test_architecture_greedy_merge_hillclimbs_when_better():
+    """Pin the greedy contract: when a specialist's layer scores strictly
+    higher on eval_fn, keep the swap; when neither improves, keep base."""
+    import torch
+    # Minimal "state dict" with two encoder layers.
+    def _sd(a0, a1):
+        return {
+            "encoder.layer.0.weight": torch.tensor([a0]),
+            "encoder.layer.1.weight": torch.tensor([a1]),
+            # a non-layer tensor that must not get swept into any layer slice:
+            "classifier.weight": torch.tensor([99.0]),
+        }
+    base = _sd(1.0, 1.0)
+    spec_a = _sd(2.0, 1.0)   # improves layer 0 if eval_fn rewards it
+    spec_b = _sd(1.0, 3.0)   # improves layer 1 if eval_fn rewards it
+
+    # eval_fn: score = sum of layer-0 and layer-1 tensor values. The classifier
+    # is ignored so we can tell layer swaps apart from accidental head copies.
+    def eval_fn(sd):
+        return float(sd["encoder.layer.0.weight"].item() + sd["encoder.layer.1.weight"].item())
+
+    from mergese import architecture_greedy_merge
+    merged, stats = architecture_greedy_merge(
+        base_sd=base, specialist_sds=[spec_a, spec_b], eval_fn=eval_fn,
+    )
+    # Both layers took the better specialist's weights.
+    assert merged["encoder.layer.0.weight"].item() == 2.0
+    assert merged["encoder.layer.1.weight"].item() == 3.0
+    assert merged["classifier.weight"].item() == 99.0   # classifier untouched
+    assert stats["layer_winners"] == [0, 1]  # specialist 0 won L0, specialist 1 won L1
+    assert stats["final_score"] > stats["base_score"]
+
+
+def test_architecture_greedy_keeps_base_when_no_swap_helps():
+    import torch
+    sd = {"encoder.layer.0.weight": torch.tensor([5.0])}
+    base = sd
+    worse = {"encoder.layer.0.weight": torch.tensor([-99.0])}
+    from mergese import architecture_greedy_merge
+    merged, stats = architecture_greedy_merge(
+        base_sd=base, specialist_sds=[worse],
+        eval_fn=lambda s: float(s["encoder.layer.0.weight"].item()),
+    )
+    assert merged["encoder.layer.0.weight"].item() == 5.0
+    assert stats["layer_winners"] == [-1]
+    assert stats["final_score"] == stats["base_score"]
+
+
+def test_architecture_merge_detects_encoder_layout():
+    """Covers both the bare-encoder and classification-head-wrapped layouts."""
+    from mergese import _encoder_layer_prefixes
+    bare = ["encoder.layer.0.weight", "encoder.layer.1.weight", "pooler.weight"]
+    pfx, n = _encoder_layer_prefixes(bare)
+    assert pfx == "encoder.layer." and n == 2
+    wrapped = ["bert.encoder.layer.0.weight", "bert.encoder.layer.1.weight",
+               "bert.encoder.layer.2.weight", "classifier.weight"]
+    pfx, n = _encoder_layer_prefixes(wrapped)
+    assert pfx == "bert.encoder.layer." and n == 3
+    import pytest
+    with pytest.raises(ValueError, match="encoder.layer"):
+        _encoder_layer_prefixes(["no.such.pattern.0"])

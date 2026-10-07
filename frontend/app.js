@@ -846,6 +846,13 @@ const METHOD_DEFAULTS = {
                  dropHint: "ignored - averaging doesn't use DARE",
                  wudiHint: "not used by averaging (only WUDI)",
                  pcbHint:  "not used by averaging (only PCB)" },
+  "architecture": { trim: 0, drop: 0.0, trimEnabled: false, dropEnabled: false,
+                 wudiEnabled: false, pcbEnabled: false, archEnabled: true,
+                 archHint:  "Greedy layer-swap stitch - hill-climbs encoder layers against the eval slice",
+                 trimHint: "ignored - architecture merge swaps whole layers, not deltas",
+                 dropHint: "ignored - architecture merge doesn't use DARE",
+                 wudiHint: "not used by architecture (only WUDI)",
+                 pcbHint:  "not used by architecture (only PCB)" },
 };
 
 // Toggle visibility of the <label> wrapping `input`. Grid auto-flow collapses
@@ -861,6 +868,7 @@ function applyMethodDefaults(method, opts = {}) {
   const trim = $("#mTrim"), drop = $("#mDrop");
   const wudiSteps = $("#mWudiSteps"), wudiLr = $("#mWudiLr");
   const pcbRatio = $("#mPcbRatio"), pcbLambda = $("#mPcbLambda"), pcbScope = $("#mPcbScope");
+  const evalData = $("#mEvalDataList"), evalLimit = $("#mEvalLimit");
 
   // Reset values to the method's recommended defaults on an explicit method
   // change (overwrite=true, the default). On initial render / preset load we
@@ -882,6 +890,12 @@ function applyMethodDefaults(method, opts = {}) {
   _toggleField(pcbRatio,  d.pcbEnabled);
   _toggleField(pcbLambda, d.pcbEnabled);
   _toggleField(pcbScope,  d.pcbEnabled);
+  _toggleField(evalData,  !!d.archEnabled);
+  _toggleField(evalLimit, !!d.archEnabled);
+  if (d.archEnabled) {
+    $("#mEvalDataHint").textContent  = d.archHint;
+    $("#mEvalLimitHint").textContent = "default 200 rows - more = slower but less variance";
+  }
 
   // Only populate hints on the fields that are visible.
   if (d.trimEnabled) $("#mTrimHint").textContent = d.trimHint;
@@ -942,6 +956,14 @@ function bindForms() {
       body.pcb_ratio  = parseFloat($("#mPcbRatio").value);
       body.pcb_lambda = parseFloat($("#mPcbLambda").value);
       body.pcb_scope  = $("#mPcbScope").value;
+    }
+    if (method === "architecture") {
+      const evalDataRef = readModelList("mEvalDataList")[0];
+      if (!evalDataRef) {
+        toast("Pick an eval dataset for architecture merge.", "err"); return;
+      }
+      body.eval_data = evalDataRef;
+      body.eval_limit = parseInt($("#mEvalLimit").value, 10);
     }
     submit("/api/merge", body, { kind: "merge" });
   });
