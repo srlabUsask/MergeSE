@@ -2,7 +2,7 @@
 # Builds a CPU-only image. For GPU evaluations on the host, run with --gpus all
 # and torch will pick CUDA automatically.
 
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
